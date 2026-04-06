@@ -8,7 +8,6 @@ Levels:
 import logging
 from dataclasses import dataclass
 
-from cdumm.archive.format_parsers import identify_records_for_file
 from cdumm.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -166,26 +165,45 @@ class ConflictDetector:
             a_entries = {d["entry_path"] for d in a_deltas if d.get("entry_path")}
             b_entries = {d["entry_path"] for d in b_deltas if d.get("entry_path")}
 
-            if a_entries and b_entries:
-                # Both use ENTR deltas — compare at entry level
-                shared_entries = a_entries & b_entries
-                if shared_entries:
-                    for entry_path in sorted(shared_entries):
+            if a_entries or b_entries:
+                if a_entries and b_entries:
+                    # Both use ENTR deltas — compare at entry level
+                    shared_entries = a_entries & b_entries
+                    if shared_entries:
+                        for entry_path in sorted(shared_entries):
+                            conflicts.append(Conflict(
+                                mod_a_id=mod_a_id, mod_a_name=mod_a_name,
+                                mod_b_id=mod_b_id, mod_b_name=mod_b_name,
+                                file_path=file_path,
+                                level="byte_range",
+                                byte_start=None, byte_end=None,
+                                explanation=(
+                                    f"{mod_a_name} and {mod_b_name} both modify "
+                                    f"{entry_path} in {file_path}. "
+                                    f"Winner: {winner_name} (higher load order)."
+                                ),
+                                winner_id=winner_id, winner_name=winner_name,
+                            ))
+                    else:
+                        # Different entries in the same PAZ — compatible
                         conflicts.append(Conflict(
                             mod_a_id=mod_a_id, mod_a_name=mod_a_name,
                             mod_b_id=mod_b_id, mod_b_name=mod_b_name,
                             file_path=file_path,
-                            level="byte_range",
+                            level="paz",
                             byte_start=None, byte_end=None,
                             explanation=(
-                                f"{mod_a_name} and {mod_b_name} both modify "
-                                f"{entry_path} in {file_path}. "
-                                f"Winner: {winner_name} (higher load order)."
+                                f"{mod_a_name} and {mod_b_name} both modify {file_path} "
+                                "but different game files inside it. Compatible."
                             ),
-                            winner_id=winner_id, winner_name=winner_name,
                         ))
                 else:
-                    # Different entries in the same PAZ — compatible
+                    # One mod uses ENTR (entry-level) patching, the other uses byte-level.
+                    # ENTR composition is a separate path from byte-level patching, so
+                    # byte-range comparison would generate false conflicts.
+                    # Report PAZ-level to flag potential incompatibility without blocking.
+                    entr_mod = mod_a_name if a_entries else mod_b_name
+                    byte_mod = mod_b_name if a_entries else mod_a_name
                     conflicts.append(Conflict(
                         mod_a_id=mod_a_id, mod_a_name=mod_a_name,
                         mod_b_id=mod_b_id, mod_b_name=mod_b_name,
@@ -193,8 +211,9 @@ class ConflictDetector:
                         level="paz",
                         byte_start=None, byte_end=None,
                         explanation=(
-                            f"{mod_a_name} and {mod_b_name} both modify {file_path} "
-                            "but different game files inside it. Compatible."
+                            f"{entr_mod} uses entry-level patching and "
+                            f"{byte_mod} uses byte-level patching for {file_path}. "
+                            "Likely compatible — verify manually if issues occur."
                         ),
                     ))
                 continue
@@ -221,7 +240,7 @@ class ConflictDetector:
 
             # Too many ranges for O(n²) — report PAZ-level and skip
             MAX_RANGES_FOR_BYTECMP = 10_000
-            if len(a_ranges) * len(b_ranges) > MAX_RANGES_FOR_BYTECMP * MAX_RANGES_FOR_BYTECMP:
+            if len(a_ranges) * len(b_ranges) > MAX_RANGES_FOR_BYTECMP:
                 conflicts.append(Conflict(
                     mod_a_id=mod_a_id, mod_a_name=mod_a_name,
                     mod_b_id=mod_b_id, mod_b_name=mod_b_name,
@@ -237,42 +256,34 @@ class ConflictDetector:
                 ))
                 continue
 
-            # Check for byte-range overlaps
+            # Check for byte-range overlaps; report at most one conflict per file pair
+            # to avoid flooding the 200-conflict cap from a single heavily-overlapping pair.
             has_overlap = False
+            overlap_start = overlap_end = 0
             for a_start, a_end in a_ranges:
                 for b_start, b_end in b_ranges:
                     if a_start < b_end and b_start < a_end:
-                        # Overlap detected
                         has_overlap = True
                         overlap_start = max(a_start, b_start)
                         overlap_end = min(a_end, b_end)
+                        break
+                if has_overlap:
+                    break
 
-                        # Try to get record-level explanation
-                        record_info = identify_records_for_file(
-                            file_path, overlap_start, overlap_end
-                        )
-                        if record_info:
-                            explanation = (
-                                f"{mod_a_name} and {mod_b_name} both modify "
-                                f"{record_info} in {file_path}. "
-                                f"Winner: {winner_name} (higher load order)."
-                            )
-                        else:
-                            explanation = (
-                                f"{mod_a_name} and {mod_b_name} both modify "
-                                f"bytes {overlap_start}-{overlap_end} in {file_path}. "
-                                f"Winner: {winner_name} (higher load order)."
-                            )
-
-                        conflicts.append(Conflict(
-                            mod_a_id=mod_a_id, mod_a_name=mod_a_name,
-                            mod_b_id=mod_b_id, mod_b_name=mod_b_name,
-                            file_path=file_path,
-                            level="byte_range",
-                            byte_start=overlap_start, byte_end=overlap_end,
-                            explanation=explanation,
-                            winner_id=winner_id, winner_name=winner_name,
-                        ))
+            if has_overlap:
+                conflicts.append(Conflict(
+                    mod_a_id=mod_a_id, mod_a_name=mod_a_name,
+                    mod_b_id=mod_b_id, mod_b_name=mod_b_name,
+                    file_path=file_path,
+                    level="byte_range",
+                    byte_start=overlap_start, byte_end=overlap_end,
+                    explanation=(
+                        f"{mod_a_name} and {mod_b_name} both modify "
+                        f"bytes {overlap_start}-{overlap_end} in {file_path}. "
+                        f"Winner: {winner_name} (higher load order)."
+                    ),
+                    winner_id=winner_id, winner_name=winner_name,
+                ))
 
             if not has_overlap:
                 # Same file, no byte overlap → PAZ-level warning

@@ -142,6 +142,8 @@ def test_check_new_mod(db: Database) -> None:
 
 
 def test_multiple_byte_range_conflicts(db: Database) -> None:
+    # Two mods with two overlapping range pairs each — detector now reports
+    # at most ONE byte_range conflict per file pair (first overlap wins).
     _insert_mod_with_deltas(db, 1, "ModA", [
         ("0008/0.paz", 100, 200),
         ("0008/0.paz", 500, 600),
@@ -154,4 +156,6 @@ def test_multiple_byte_range_conflicts(db: Database) -> None:
     detector = ConflictDetector(db)
     conflicts = detector.detect_all()
     byte_conflicts = [c for c in conflicts if c.level == "byte_range"]
-    assert len(byte_conflicts) == 2
+    # One conflict per file pair, not one per overlapping range pair
+    assert len(byte_conflicts) == 1
+    assert byte_conflicts[0].file_path == "0008/0.paz"

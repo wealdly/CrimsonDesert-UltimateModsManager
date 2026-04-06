@@ -997,10 +997,12 @@ class ApplyWorker(QObject):
                                game_file, e)
                 continue
 
-            # Apply all patches: lowest priority first, highest last (wins)
+            # Apply all patches in priority order: highest priority number first,
+            # lowest last — last write wins — so the top-of-list mod (lowest priority
+            # number, same convention as SPRS patches) wins any overlap.
             merged = bytearray(vanilla_content)
             mod_names = []
-            for d, patch_info in reversed(mod_patches):
+            for d, patch_info in mod_patches:
                 for change in patch_info.get("changes", []):
                     offset = change.get("offset", 0)
                     try:
@@ -1056,8 +1058,9 @@ class ApplyWorker(QObject):
             merged = bytearray(vanilla_content)
             mod_names = []
 
-            # Apply lowest priority first (reversed — deltas are sorted high-pri first)
-            for d in reversed(group_deltas):
+            # Apply lowest priority first (high-priority DESC order — iterate as-is;
+            # last write wins — so top-of-list mod wins, same as SPRS patches)
+            for d in group_deltas:
                 try:
                     mod_paz = apply_delta_from_file(
                         vanilla_paz, Path(d["delta_path"]))

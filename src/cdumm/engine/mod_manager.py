@@ -258,7 +258,7 @@ class ModManager:
         return cursor.fetchone()[0]
 
     def move_up(self, mod_id: int) -> None:
-        """Move a mod higher in load order (lower priority number = loaded earlier = loses conflicts)."""
+        """Move a mod higher in load order (lower priority number = applied last = wins conflicts)."""
         mods = self.list_mods()
         idx = next((i for i, m in enumerate(mods) if m["id"] == mod_id), None)
         if idx is None or idx == 0:
@@ -267,7 +267,7 @@ class ModManager:
         logger.info("Moved mod %d up in load order", mod_id)
 
     def move_down(self, mod_id: int) -> None:
-        """Move a mod lower in load order (higher priority number = loaded later = wins conflicts)."""
+        """Move a mod lower in load order (higher priority number = applied first = loses conflicts)."""
         mods = self.list_mods()
         idx = next((i for i, m in enumerate(mods) if m["id"] == mod_id), None)
         if idx is None or idx >= len(mods) - 1:
