@@ -15,77 +15,15 @@ import struct
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 import lz4.block
 
+from cdumm.archive.hashlittle import INTEGRITY_SEED as HASH_INITVAL, hashlittle
+
 # ── Key derivation constants ─────────────────────────────────────────
 
-HASH_INITVAL = 0x000C5EDE
 IV_XOR = 0x60616263
 XOR_DELTAS = [
     0x00000000, 0x0A0A0A0A, 0x0C0C0C0C, 0x06060606,
     0x0E0E0E0E, 0x0A0A0A0A, 0x06060606, 0x02020202,
 ]
-
-
-# ── Bob Jenkins' lookup3 hashlittle ──────────────────────────────────
-
-def _rot(v, k):
-    return ((v << k) | (v >> (32 - k))) & 0xFFFFFFFF
-
-def _add(a, b):
-    return (a + b) & 0xFFFFFFFF
-
-def _sub(a, b):
-    return (a - b) & 0xFFFFFFFF
-
-
-def hashlittle(data: bytes, initval: int = 0) -> int:
-    """Bob Jenkins' lookup3 hashlittle — returns the primary hash (c)."""
-    length = len(data)
-    a = b = c = _add(0xDEADBEEF + length, initval)
-    off = 0
-
-    while length > 12:
-        a = _add(a, struct.unpack_from('<I', data, off)[0])
-        b = _add(b, struct.unpack_from('<I', data, off + 4)[0])
-        c = _add(c, struct.unpack_from('<I', data, off + 8)[0])
-        # mix
-        a = _sub(a, c); a ^= _rot(c, 4);  c = _add(c, b)
-        b = _sub(b, a); b ^= _rot(a, 6);  a = _add(a, c)
-        c = _sub(c, b); c ^= _rot(b, 8);  b = _add(b, a)
-        a = _sub(a, c); a ^= _rot(c, 16); c = _add(c, b)
-        b = _sub(b, a); b ^= _rot(a, 19); a = _add(a, c)
-        c = _sub(c, b); c ^= _rot(b, 4);  b = _add(b, a)
-        off += 12
-        length -= 12
-
-    # Handle remaining bytes (zero-padded to 12)
-    tail = data[off:] + b'\x00' * 12
-    if length >= 12:
-        c = _add(c, struct.unpack_from('<I', tail, 8)[0])
-    elif length >= 9:
-        v = struct.unpack_from('<I', tail, 8)[0]
-        c = _add(c, v & (0xFFFFFFFF >> (8 * (12 - length))))
-    if length >= 8:
-        b = _add(b, struct.unpack_from('<I', tail, 4)[0])
-    elif length >= 5:
-        v = struct.unpack_from('<I', tail, 4)[0]
-        b = _add(b, v & (0xFFFFFFFF >> (8 * (8 - length))))
-    if length >= 4:
-        a = _add(a, struct.unpack_from('<I', tail, 0)[0])
-    elif length >= 1:
-        v = struct.unpack_from('<I', tail, 0)[0]
-        a = _add(a, v & (0xFFFFFFFF >> (8 * (4 - length))))
-    elif length == 0:
-        return c
-
-    # final
-    c ^= b; c = _sub(c, _rot(b, 14))
-    a ^= c; a = _sub(a, _rot(c, 11))
-    b ^= a; b = _sub(b, _rot(a, 25))
-    c ^= b; c = _sub(c, _rot(b, 16))
-    a ^= c; a = _sub(a, _rot(c, 4))
-    b ^= a; b = _sub(b, _rot(a, 14))
-    c ^= b; c = _sub(c, _rot(b, 24))
-    return c
 
 
 # ── Key derivation ───────────────────────────────────────────────────

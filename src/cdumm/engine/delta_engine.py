@@ -7,6 +7,7 @@ Uses two strategies:
 Sparse patch format:
   b"SPRS" + u32 patch_count + (u64 offset, u32 length, bytes data) * N
 """
+import json
 import logging
 import struct
 from pathlib import Path
@@ -274,7 +275,6 @@ def load_delta(delta_path: Path) -> bytes:
 
 def save_entry_delta(content: bytes, metadata: dict, delta_path: Path) -> None:
     """Save an entry-level delta (decompressed content + PAMT entry info)."""
-    import json
     meta_json = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
     buf = bytearray(ENTRY_MAGIC)
     buf += struct.pack("<I", len(meta_json))
@@ -288,7 +288,6 @@ def save_entry_delta(content: bytes, metadata: dict, delta_path: Path) -> None:
 
 def load_entry_delta(delta_path: Path) -> tuple[bytes, dict]:
     """Load an entry-level delta. Returns (decompressed_content, metadata)."""
-    import json
     raw = delta_path.read_bytes()
     if raw[:4] != ENTRY_MAGIC:
         raise ValueError(f"Not an entry delta: {delta_path}")

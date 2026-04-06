@@ -53,6 +53,11 @@ class PazEntry:
         return self.path.lower().endswith('.xml')
 
 
+def make_pamt_search_pattern(entry: PazEntry) -> bytes:
+    """Return the 16-byte PAMT record search key for *entry*."""
+    return struct.pack("<IIII", entry.offset, entry.comp_size, entry.orig_size, entry.flags)
+
+
 def parse_pamt(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
     """Parse a .pamt index file and return all file entries.
 

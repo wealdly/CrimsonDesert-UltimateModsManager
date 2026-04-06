@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from cdumm.archive.paz_format import is_paz_dir
 from cdumm.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -219,7 +220,7 @@ class SnapshotWorker(QObject):
 
         # 1. Check for mod-created directories (0036+)
         for d in sorted(self._game_dir.iterdir()):
-            if not d.is_dir() or not d.name.isdigit() or len(d.name) != 4:
+            if not d.is_dir() or not is_paz_dir(d.name):
                 continue
             if int(d.name) >= 36:
                 files = list(d.iterdir())
@@ -315,7 +316,7 @@ class SnapshotManager:
         changes: list[tuple[str, str]] = []
         cursor = self._db.connection.execute("SELECT file_path, file_hash FROM snapshots")
         for rel_path, stored_hash in cursor.fetchall():
-            abs_path = game_dir / rel_path.replace("/", "\\")
+            abs_path = game_dir / rel_path
             if not abs_path.exists():
                 changes.append((rel_path, "deleted"))
             else:

@@ -52,7 +52,7 @@ from pathlib import Path
 
 import lz4.block
 
-from cdumm.archive.paz_parse import parse_pamt, PazEntry
+from cdumm.archive.paz_parse import make_pamt_search_pattern, parse_pamt, PazEntry
 from cdumm.archive.paz_crypto import decrypt, encrypt, lz4_decompress, lz4_compress
 from cdumm.archive.paz_repack import repack_entry_bytes, _save_timestamps
 
@@ -398,7 +398,7 @@ def _update_pamt_record(pamt_path: Path, entry: PazEntry,
                          paz_index, old_size, new_paz_size)
 
     # Search for the 16-byte pattern: offset + comp_size + orig_size + flags
-    search = struct.pack('<IIII', entry.offset, entry.comp_size, entry.orig_size, entry.flags)
+    search = make_pamt_search_pattern(entry)
 
     pos = 0
     found = False

@@ -21,7 +21,8 @@ from pathlib import Path
 
 import struct
 
-from cdumm.archive.paz_parse import parse_pamt, PazEntry
+from cdumm.archive.paz_format import is_paz_dir
+from cdumm.archive.paz_parse import make_pamt_search_pattern, parse_pamt, PazEntry
 from cdumm.archive.paz_repack import repack_entry_bytes, _save_timestamps
 
 logger = logging.getLogger(__name__)
@@ -275,7 +276,7 @@ def _resolve_files_to_directories(
     all_matches: dict[str, list[tuple[str, str, Path]]] = {}
 
     for d in sorted(game_dir.iterdir()):
-        if not d.is_dir() or not d.name.isdigit() or len(d.name) != 4:
+        if not d.is_dir() or not is_paz_dir(d.name):
             continue
         pamt = d / "0.pamt"
         if not pamt.exists():
@@ -333,7 +334,7 @@ def _update_pamt_entries(pamt_path: Path, updates: list[tuple[PazEntry, int, int
                 struct.pack_into('<I', data, size_off, new_paz_size)
                 logger.info("Updated PAMT PAZ[%d] size to %d", paz_index, new_paz_size)
 
-        search = struct.pack('<IIII', entry.offset, entry.comp_size, entry.orig_size, entry.flags)
+        search = make_pamt_search_pattern(entry)
         idx = data.find(search)
         if idx < 0:
             logger.warning("Could not find PAMT record for %s", entry.path)

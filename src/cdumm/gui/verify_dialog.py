@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QProgressDialog,
 )
 
+from cdumm.archive.paz_format import is_paz_dir
 from cdumm.engine.snapshot_manager import hash_file, hash_matches
 from cdumm.storage.database import Database
 
@@ -84,7 +85,7 @@ class VerifyWorker(QObject):
 
             # Check for extra mod directories
             for d in sorted(self._game_dir.iterdir()):
-                if not d.is_dir() or not d.name.isdigit() or len(d.name) != 4:
+                if not d.is_dir() or not is_paz_dir(d.name):
                     continue
                 if int(d.name) >= 36:
                     files = [f.name for f in d.iterdir() if f.is_file()]

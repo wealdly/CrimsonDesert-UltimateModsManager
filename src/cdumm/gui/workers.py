@@ -36,6 +36,7 @@ class ImportWorker(QObject):
         self._existing_mod_id = existing_mod_id
 
     def run(self) -> None:
+    
         try:
             # Create thread-local DB connection
             db = Database(self._db_path)
@@ -49,6 +50,7 @@ class ImportWorker(QObject):
             from cdumm.engine.import_handler import set_import_progress_cb
             set_import_progress_cb(lambda pct, msg: self.progress_updated.emit(pct, msg))
 
+        
             if fmt == "zip":
                 result = import_from_zip(
                     self._mod_path, self._game_dir, db, snapshot, self._deltas_dir,
@@ -79,6 +81,7 @@ class ImportWorker(QObject):
 
             db.close()
 
+        
             if result.error:
                 self.error_occurred.emit(result.error)
             else:
@@ -102,6 +105,7 @@ class PreHashWorker(QObject):
         self._db_path = db_path
 
     def run(self) -> None:
+    
         try:
             from cdumm.engine.snapshot_manager import hash_file as _hash_file
 
@@ -117,12 +121,14 @@ class PreHashWorker(QObject):
             logger.info("PreHashWorker: hashing %d files", total)
 
             pre_hashes: dict[str, str] = {}
+        
             for i, rel_path in enumerate(all_files):
-                game_file = self._game_dir / rel_path.replace("/", "\\")
+                game_file = self._game_dir / rel_path            
                 if game_file.exists():
                     h, _ = _hash_file(game_file)
                     pre_hashes[rel_path] = h
 
+            
                 if (i + 1) % 5 == 0 or (i + 1) == total:
                     pct = int((i + 1) / total * 100)
                     self.progress_updated.emit(pct, f"Hashed {i + 1}/{total} files...")
@@ -149,6 +155,7 @@ class ScriptPrepWorker(QObject):
         self._vanilla_dir = vanilla_dir
 
     def run(self) -> None:
+    
         try:
             import os
             import shutil
@@ -157,6 +164,7 @@ class ScriptPrepWorker(QObject):
             from cdumm.storage.database import Database
 
             total = len(self._targeted) if self._targeted else 0
+        
             if total == 0:
                 self.finished.emit(None)
                 return
@@ -166,16 +174,20 @@ class ScriptPrepWorker(QObject):
             # Find the DB by walking up from vanilla_dir (CDMods/vanilla -> game_dir)
             # The DB is at AppData, but we can check snapshot inline
             snap_hashes: dict[str, str] = {}
+        
             try:
                 # Try to find DB path from standard location
                 db_path = Path.home() / "AppData" / "Local" / "cdumm" / "cdumm.db"
+            
                 if db_path.exists():
                     db = Database(db_path)
                     db.initialize()
+                
                     for rel_path in self._targeted:
                         row = db.connection.execute(
                             "SELECT file_hash FROM snapshots WHERE file_path = ?",
                             (rel_path,)).fetchone()
+                    
                         if row:
                             snap_hashes[rel_path] = row[0]
                     db.close()
@@ -185,38 +197,49 @@ class ScriptPrepWorker(QObject):
             # Step 1: Back up and restore only files that need it
             backed_up = 0
             restored = 0
+        
             for i, rel_path in enumerate(self._targeted):
                 pct = int((i / total) * 50)
                 game_file = self._game_dir / rel_path.replace("/", os.sep)
                 vanilla_file = self._vanilla_dir / rel_path.replace("/", os.sep)
 
+            
                 if not game_file.exists():
+                
                     continue
 
                 # Check if game file already matches vanilla snapshot
+            
                 if rel_path in snap_hashes:
                     current_hash, _ = _hash_file(game_file)
+                
                     if current_hash == snap_hashes[rel_path]:
                         # Already vanilla — just ensure backup exists, no restore needed
+                    
                         if not vanilla_file.exists():
                             self.progress_updated.emit(pct, f"Backing up {rel_path}...")
                             _ensure_vanilla_backup(self._game_dir, self._vanilla_dir, rel_path)
                             backed_up += 1
+                    
                         continue
 
                 # File is modified — back up and restore
+            
                 if not vanilla_file.exists():
                     self.progress_updated.emit(pct, f"Backing up {rel_path}...")
                     _ensure_vanilla_backup(self._game_dir, self._vanilla_dir, rel_path)
                     backed_up += 1
 
+            
                 if vanilla_file.exists():
                     self.progress_updated.emit(pct, f"Restoring {rel_path}...")
                     shutil.copy2(str(vanilla_file), str(game_file))
                     restored += 1
 
+        
             if backed_up:
                 logger.info("Backed up %d vanilla files", backed_up)
+        
             if restored:
                 logger.info("Restored %d files to vanilla for clean import", restored)
             else:
@@ -228,10 +251,13 @@ class ScriptPrepWorker(QObject):
             # This way ScriptCaptureWorker detects ALL changes, not just predicted.
             db_path2 = Path.home() / "AppData" / "Local" / "cdumm" / "cdumm.db"
             all_snap: dict[str, str] = {}
+        
             try:
+            
                 if db_path2.exists():
                     db2 = Database(db_path2)
                     db2.initialize()
+                
                     for row in db2.connection.execute("SELECT file_path, file_hash FROM snapshots").fetchall():
                         all_snap[row[0]] = row[1]
                     db2.close()
@@ -241,15 +267,20 @@ class ScriptPrepWorker(QObject):
             pre_hashes = {}
             all_files = list(all_snap.keys()) if all_snap else self._targeted
             hash_total = len(all_files)
+        
             for i, rel_path in enumerate(all_files):
+            
                 if (i + 1) % 20 == 0:
                     pct = 50 + int((i / hash_total) * 50)
                     self.progress_updated.emit(pct, f"Pre-hashing {i+1}/{hash_total}...")
 
                 game_file = self._game_dir / rel_path.replace("/", os.sep)
+            
                 if not game_file.exists():
+                
                     continue
 
+            
                 if rel_path in self._targeted:
                     # Targeted file — was just restored, hash it fresh
                     h, _ = _hash_file(game_file)
@@ -292,6 +323,7 @@ class ScriptCaptureWorker(QObject):
         self._pre_stats = pre_stats or {}
 
     def run(self) -> None:
+    
         try:
             from cdumm.engine.snapshot_manager import hash_file as _hash_file
             from cdumm.engine.import_handler import ModImportResult
@@ -307,35 +339,44 @@ class ScriptCaptureWorker(QObject):
             # 900MB PAZ files that the script didn't touch.
             changed: list[str] = []
             skipped = 0
+        
             for file_idx, (rel_path, old_hash) in enumerate(self._pre_hashes.items()):
+            
                 if file_idx % 20 == 0:
                     pct = int((file_idx / max(total_files, 1)) * 18)
                     self.progress_updated.emit(
                         pct, f"Checking {file_idx + 1}/{total_files}...")
 
-                game_file = self._game_dir / rel_path.replace("/", "\\")
+                game_file = self._game_dir / rel_path            
                 if not game_file.exists():
+                
                     continue
 
                 # Fast path: if size+mtime unchanged, file wasn't touched
                 pre = self._pre_stats.get(rel_path)
+            
                 if pre:
+                
                     try:
                         st = game_file.stat()
+                    
                         if st.st_size == pre[0] and st.st_mtime == pre[1]:
                             skipped += 1
+                        
                             continue
                     except OSError:
                         pass
 
                 # Size or mtime changed — need full hash to confirm
                 new_hash, _ = _hash_file(game_file)
+            
                 if new_hash != old_hash:
                     changed.append(rel_path)
 
             logger.info("Change detection: %d changed, %d skipped (size+mtime match), %d total",
                         len(changed), skipped, total_files)
 
+        
             if not changed:
                 result = ModImportResult(self._mod_name)
                 result.error = (
@@ -371,6 +412,7 @@ class ScriptCaptureWorker(QObject):
             other_files = [f for f in changed if f not in skipped and f not in paz_files]
 
             # ── Entry-level capture for PAZ files ──────────────────────
+        
             if paz_files:
                 self.progress_updated.emit(25, "Analyzing PAZ entries...")
                 entry_count = self._capture_paz_entries(
@@ -379,6 +421,7 @@ class ScriptCaptureWorker(QObject):
                             entry_count, len(paz_files))
 
             # ── Byte-level capture for non-PAZ files (rare/shouldn't happen) ──
+        
             if other_files:
                 from cdumm.engine.delta_engine import (
                     generate_delta, get_changed_byte_ranges, save_delta,
@@ -386,18 +429,22 @@ class ScriptCaptureWorker(QObject):
                 from cdumm.engine.apply_engine import _save_range_backup
                 import hashlib
 
+            
                 for idx, rel_path in enumerate(other_files):
                     pct = 70 + int((idx + 1) / len(other_files) * 20)
                     self.progress_updated.emit(pct, f"Delta: {rel_path}...")
 
-                    vanilla_path = vanilla_dir / rel_path.replace("/", "\\")
+                    vanilla_path = vanilla_dir / rel_path
+                
                     if not vanilla_path.exists():
+                    
                         continue
                     vanilla_bytes = vanilla_path.read_bytes()
-                    modified_bytes = (self._game_dir / rel_path.replace("/", "\\")).read_bytes()
+                    modified_bytes = (self._game_dir / rel_path).read_bytes()
 
                     delta_bytes = generate_delta(vanilla_bytes, modified_bytes)
                     byte_ranges = ([(0, len(modified_bytes))]
+                               
                                    if delta_bytes[:4] == b"FULL"
                                    else get_changed_byte_ranges(vanilla_bytes, modified_bytes))
 
@@ -406,6 +453,7 @@ class ScriptCaptureWorker(QObject):
                     save_delta(delta_bytes, delta_path)
                     _save_range_backup(self._game_dir, vanilla_dir, rel_path, byte_ranges)
 
+                
                     for bs, be in byte_ranges:
                         vh = hashlib.sha256(vanilla_bytes[bs:be]).hexdigest()[:16]
                         db.connection.execute(
@@ -453,11 +501,13 @@ class ScriptCaptureWorker(QObject):
 
         # Group PAZ files by directory
         by_dir: dict[str, list[str]] = {}
+    
         for paz_rel in paz_files:
             pamt_dir = paz_rel.split("/")[0]
             by_dir.setdefault(pamt_dir, []).append(paz_rel)
 
         total_dirs = len(by_dir)
+    
         for dir_idx, (pamt_dir, paz_rels) in enumerate(sorted(by_dir.items())):
             pct = 25 + int((dir_idx / total_dirs) * 45)
             self.progress_updated.emit(pct, f"Analyzing entries in {pamt_dir}/...")
@@ -466,13 +516,16 @@ class ScriptCaptureWorker(QObject):
             vanilla_pamt = vanilla_dir / pamt_dir / "0.pamt"
             modified_pamt = self._game_dir / pamt_dir / "0.pamt"
 
+        
             if not vanilla_pamt.exists() or not modified_pamt.exists():
                 logger.warning("PAMT not found for %s, skipping entry capture", pamt_dir)
+            
                 continue
 
             # vanilla_pamt in CDMods/vanilla should already be the pristine copy
             # (backed up during snapshot or first import). Don't overwrite it.
 
+        
             try:
                 vanilla_entries = parse_pamt(
                     str(vanilla_pamt), str(vanilla_dir / pamt_dir))
@@ -480,19 +533,23 @@ class ScriptCaptureWorker(QObject):
                     str(modified_pamt), str(self._game_dir / pamt_dir))
             except Exception as e:
                 logger.warning("Failed to parse PAMT for %s: %s", pamt_dir, e)
+            
                 continue
 
             # Build lookup: path -> entry (for vanilla)
             vanilla_by_path: dict[str, PazEntry] = {}
+        
             for e in vanilla_entries:
                 vanilla_by_path[e.path.lower()] = e
 
             modified_by_path: dict[str, PazEntry] = {}
+        
             for e in modified_entries:
                 modified_by_path[e.path.lower()] = e
 
             # Which PAZ indices changed?
             changed_paz_indices = set()
+        
             for paz_rel in paz_rels:
                 paz_name = paz_rel.split("/")[1]  # e.g. "4.paz"
                 paz_idx = int(paz_name.replace(".paz", ""))
@@ -501,13 +558,16 @@ class ScriptCaptureWorker(QObject):
             # Filter to entries in changed PAZ files only
             target_entries = [
                 (p, e) for p, e in modified_by_path.items()
+            
                 if e.paz_index in changed_paz_indices
             ]
             total_entries = len(target_entries)
 
             # Compare entries in changed PAZ files
+        
             for entry_idx, (path_lower, mod_entry) in enumerate(target_entries):
                 # Per-entry progress within this directory
+            
                 if total_entries > 0 and (entry_idx % 20 == 0 or entry_idx == total_entries - 1):
                     dir_pct = entry_idx / total_entries
                     pct = 25 + int(((dir_idx + dir_pct) / total_dirs) * 45)
@@ -517,13 +577,16 @@ class ScriptCaptureWorker(QObject):
                 van_entry = vanilla_by_path.get(path_lower)
 
                 # Extract decompressed content from both
+            
                 try:
                     mod_content = self._extract_entry(mod_entry)
                 except Exception as e:
                     logger.debug("Failed to extract modified %s: %s",
                                  mod_entry.path, e)
+                
                     continue
 
+            
                 if van_entry is None:
                     # New entry added by script
                     van_content = b""
@@ -531,6 +594,7 @@ class ScriptCaptureWorker(QObject):
                     # Entry moved between PAZ files — treat as new
                     van_content = b""
                 else:
+                
                     try:
                         # Extract from vanilla PAZ (which is in vanilla_dir)
                         van_paz_path = str(vanilla_dir / pamt_dir
@@ -548,9 +612,12 @@ class ScriptCaptureWorker(QObject):
                     except Exception as e:
                         logger.debug("Failed to extract vanilla %s: %s",
                                      van_entry.path, e)
+                    
                         continue
 
+            
                 if mod_content == van_content:
+                
                     continue  # Entry unchanged
 
                 # Store ENTR delta
@@ -601,6 +668,7 @@ class ScriptCaptureWorker(QObject):
                             mod_entry.path, pamt_dir, mod_entry.paz_index,
                             len(van_content), len(mod_content))
 
+    
         return count
 
     @staticmethod
@@ -609,22 +677,29 @@ class ScriptCaptureWorker(QObject):
         import os
         from cdumm.archive.paz_crypto import decrypt, lz4_decompress
 
+    
         with open(entry.paz_file, "rb") as f:
             f.seek(entry.offset)
             raw = f.read(entry.comp_size)
 
         basename = os.path.basename(entry.path)
 
+    
         if entry.compressed and entry.compression_type == 2:
+        
             try:
+            
                 return lz4_decompress(raw, entry.orig_size)
             except Exception:
                 decrypted = decrypt(raw, basename)
+            
                 return lz4_decompress(decrypted, entry.orig_size)
 
+    
         if entry.encrypted:
             raw = decrypt(raw, basename)
 
+    
         return raw
 
 
@@ -660,14 +735,18 @@ class ScanChangesWorker(QObject):
 
         file_deltas: dict[str, list[dict]] = {}
         seen: set[str] = set()
+    
         for file_path, delta_path, mod_name in cursor.fetchall():
+        
             if delta_path in seen:
+            
                 continue
             seen.add(delta_path)
             file_deltas.setdefault(file_path, []).append({
                 "delta_path": delta_path,
                 "mod_name": mod_name,
             })
+    
         return file_deltas
 
     def run(self) -> None:
@@ -677,6 +756,7 @@ class ScanChangesWorker(QObject):
         are compared at the PAMT entry level (decompressed content), so
         different entries compose correctly across mods.
         """
+    
         try:
             from cdumm.engine.snapshot_manager import hash_file as _hash_file
             from cdumm.engine.import_handler import ModImportResult
@@ -694,19 +774,24 @@ class ScanChangesWorker(QObject):
 
             # Find changed files
             changed: list[str] = []
+        
             for i, (rel_path, stored_hash) in enumerate(snapshot_rows):
-                abs_path = self._game_dir / rel_path.replace("/", "\\")
+                abs_path = self._game_dir / rel_path            
                 if not abs_path.exists():
+                
                     continue
 
                 current_hash, _ = _hash_file(abs_path)
+            
                 if current_hash != stored_hash:
                     changed.append(rel_path)
 
+            
                 if (i + 1) % 10 == 0 or (i + 1) == total:
                     pct = int((i + 1) / total * 50)
                     self.progress_updated.emit(pct, f"Scanned {i + 1}/{total} files...")
 
+        
             if not changed:
                 result = ModImportResult(self._mod_name)
                 result.error = "No changes detected. Game files match the vanilla snapshot."
@@ -734,6 +819,7 @@ class ScanChangesWorker(QObject):
             other_files = [f for f in changed if f not in skipped and f not in paz_files]
 
             # Entry-level capture for PAZ files (reuse ScriptCaptureWorker logic)
+        
             if paz_files:
                 self.progress_updated.emit(60, "Analyzing PAZ entries...")
                 # Create a temporary ScriptCaptureWorker to use its methods
@@ -745,6 +831,7 @@ class ScanChangesWorker(QObject):
                 logger.info("Captured %d entry-level deltas", entry_count)
 
             # Byte-level capture for non-PAZ files (rare)
+        
             if other_files:
                 from cdumm.engine.delta_engine import (
                     generate_delta, get_changed_byte_ranges, save_delta,
@@ -752,18 +839,22 @@ class ScanChangesWorker(QObject):
                 from cdumm.engine.apply_engine import _save_range_backup
                 import hashlib
 
+            
                 for idx, rel_path in enumerate(other_files):
                     pct = 80 + int((idx + 1) / len(other_files) * 15)
                     self.progress_updated.emit(pct, f"Delta: {rel_path}...")
 
-                    vanilla_path = vanilla_dir / rel_path.replace("/", "\\")
+                    vanilla_path = vanilla_dir / rel_path
+                
                     if not vanilla_path.exists():
+                    
                         continue
                     vanilla_bytes = vanilla_path.read_bytes()
-                    modified_bytes = (self._game_dir / rel_path.replace("/", "\\")).read_bytes()
+                    modified_bytes = (self._game_dir / rel_path).read_bytes()
 
                     delta_bytes = generate_delta(vanilla_bytes, modified_bytes)
                     byte_ranges = ([(0, len(modified_bytes))]
+                               
                                    if delta_bytes[:4] == b"FULL"
                                    else get_changed_byte_ranges(vanilla_bytes, modified_bytes))
 
@@ -772,6 +863,7 @@ class ScanChangesWorker(QObject):
                     save_delta(delta_bytes, delta_path)
                     _save_range_backup(self._game_dir, vanilla_dir, rel_path, byte_ranges)
 
+                
                     for bs, be in byte_ranges:
                         vh = hashlib.sha256(
                             vanilla_bytes[bs:be] if bs < len(vanilla_bytes) else b""
@@ -812,6 +904,7 @@ class BackupVerifyWorker(QObject):
         self._db_path = db_path
 
     def run(self) -> None:
+    
         try:
             import os
             from cdumm.engine.snapshot_manager import hash_file
@@ -821,19 +914,25 @@ class BackupVerifyWorker(QObject):
 
             # Collect all backup files
             backup_files = []
+        
             for dirpath, _, filenames in os.walk(self._vanilla_dir):
+            
                 for fname in filenames:
+                
                     if fname.endswith(".vranges"):
+                    
                         continue
                     backup_files.append(Path(dirpath) / fname)
 
             total = len(backup_files)
+        
             if total == 0:
                 self.finished.emit(0)
                 db.close()
                 return
 
             purged = 0
+        
             for i, full in enumerate(backup_files):
                 pct = int((i / total) * 100)
                 rel = str(full.relative_to(self._vanilla_dir)).replace("\\", "/")
@@ -842,10 +941,14 @@ class BackupVerifyWorker(QObject):
                 snap = db.connection.execute(
                     "SELECT file_hash FROM snapshots WHERE file_path = ?", (rel,)
                 ).fetchone()
+            
                 if snap is None:
+                
                     continue
+            
                 try:
                     backup_hash, _ = hash_file(full)
+                
                     if backup_hash != snap[0]:
                         full.unlink()
                         purged += 1
@@ -853,6 +956,7 @@ class BackupVerifyWorker(QObject):
                 except Exception as e:
                     logger.warning("Could not verify backup %s: %s", rel, e)
 
+        
             if purged:
                 logger.info("Purged %d corrupted vanilla backup(s)", purged)
 
@@ -878,6 +982,7 @@ class ModCheckWorker(QObject):
         self._db_path = db_path
 
     def run(self):
+    
         try:
             import os, hashlib
             from cdumm.archive.paz_parse import parse_pamt
@@ -891,18 +996,22 @@ class ModCheckWorker(QObject):
 
             # 1. Check if vanilla file sizes changed since import
             self.progress_updated.emit(10, "Checking vanilla file sizes...")
+        
             try:
                 size_rows = db.connection.execute(
                     "SELECT m.name, vs.file_path, vs.vanilla_size "
                     "FROM mod_vanilla_sizes vs JOIN mods m ON vs.mod_id = m.id "
                     "WHERE m.enabled = 1"
                 ).fetchall()
+            
                 for mod_name, fp, expected_size in size_rows:
                     vanilla_path = self._game_dir / "CDMods" / "vanilla" / fp.replace("/", os.sep)
                     game_path = self._game_dir / fp.replace("/", os.sep)
                     src = vanilla_path if vanilla_path.exists() else game_path
+                
                     if src.exists():
                         actual_size = src.stat().st_size
+                    
                         if actual_size != expected_size:
                             issues.append((mod_name,
                                 f"{fp} size changed ({expected_size} -> {actual_size}) — "
@@ -922,10 +1031,14 @@ class ModCheckWorker(QObject):
                 "WHERE m.enabled = 1"
             ).fetchall()
             checked_paths = set()
+        
             for mod_name, dp, fp in delta_rows:
+            
                 if dp in checked_paths:
+                
                     continue
                 checked_paths.add(dp)
+            
                 if not Path(dp).exists():
                     issues.append((mod_name, f"Missing delta file for {fp}"))
 
@@ -955,12 +1068,14 @@ class MigrateWorker(QObject):
         self._deltas_dir = deltas_dir
 
     def run(self) -> None:
+    
         try:
             db = Database(self._db_path)
             db.initialize()
 
             # Step 1: Revert to vanilla
             self.progress_updated.emit(5, "Reverting to vanilla...")
+        
             try:
                 from cdumm.engine.apply_engine import RevertWorker
                 rw = RevertWorker.__new__(RevertWorker)
@@ -988,28 +1103,35 @@ class MigrateWorker(QObject):
             failed = 0
             total = len(mods)
 
+        
             for i, (mod_id, mod_name, source_path, priority) in enumerate(mods):
                 pct = int(10 + (i / max(total, 1)) * 85)
                 self.progress_updated.emit(pct, f"Reimporting {mod_name}...")
 
                 src = sources_dir / str(mod_id)
                 has_source = src.exists() and any(src.iterdir()) if src.exists() else False
+            
                 if not has_source:
+                
                     if source_path and Path(source_path).exists():
                         src = Path(source_path)
                         has_source = True
 
+            
                 if not has_source:
                     # No source — can't reimport. Keep existing deltas as-is
                     # (they may still work). Just log and skip.
                     logger.warning("No source for %s (id=%d), keeping existing deltas",
                                    mod_name, mod_id)
                     failed += 1
+                
                     continue
 
+            
                 try:
                     logger.info("Auto-reimporting: %s from %s", mod_name, src)
                     json_data = detect_json_patch(src)
+                
                     if json_data:
                         result = import_from_json_patch(
                             src, self._game_dir, db, snapshot, self._deltas_dir,
@@ -1019,6 +1141,7 @@ class MigrateWorker(QObject):
                             src, self._game_dir, db, snapshot, self._deltas_dir,
                             mod_name, existing_mod_id=mod_id)
 
+                
                     if result.error:
                         logger.warning("Auto-reimport failed for %s: %s",
                                        mod_name, result.error)

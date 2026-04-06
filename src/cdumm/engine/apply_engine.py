@@ -21,6 +21,8 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from cdumm.archive.papgt_manager import PapgtManager
+from cdumm.archive.paz_format import is_mod_dir, is_paz_dir
+from cdumm.archive.paz_parse import make_pamt_search_pattern
 from cdumm.archive.transactional_io import TransactionalIO
 from cdumm.engine.delta_engine import (
     SPARSE_MAGIC, apply_delta, apply_delta_from_file, load_delta,
@@ -54,27 +56,36 @@ def _delta_changes_size(delta_path: Path, vanilla_size: int) -> bool:
     - bsdiff deltas that produce different size (checked by output size)
     """
     try:
+    
         with open(delta_path, "rb") as f:
             magic = f.read(4)
 
+        
             if magic == b"FULL":
                 # FULL_COPY replaces the entire file — always "changes size"
                 # conceptually, even if output happens to be same length.
                 # Must be applied before SPRS patches from other mods.
+            
                 return True
 
+        
             if magic == b"BSDI":  # bsdiff4 header "BSDIFF40"
                 # bsdiff output size is at offset 16 (8 bytes LE)
                 f.seek(16)
                 new_size = struct.unpack("<q", f.read(8))[0]
+            
                 return new_size != vanilla_size
 
+        
             if magic == SPARSE_MAGIC:
                 count = struct.unpack("<I", f.read(4))[0]
+            
                 for _ in range(count):
                     offset = struct.unpack("<Q", f.read(8))[0]
                     length = struct.unpack("<I", f.read(4))[0]
+                
                     if offset + length > vanilla_size:
+                    
                         return True
                     f.seek(length, 1)
     except Exception:
@@ -85,11 +96,14 @@ def _delta_changes_size(delta_path: Path, vanilla_size: int) -> bool:
 def _find_insertion_point(delta_path: Path) -> int:
     """Find the first offset in a sparse delta (the insertion/shift point)."""
     try:
+    
         with open(delta_path, "rb") as f:
             f.read(4)  # skip magic
             count = struct.unpack("<I", f.read(4))[0]
+        
             if count > 0:
                 offset = struct.unpack("<Q", f.read(8))[0]
+            
                 return offset
     except Exception:
         pass
@@ -105,20 +119,25 @@ def _apply_sparse_shifted(
     """
     with open(delta_path, "rb") as f:
         magic = f.read(4)
+    
         if magic != SPARSE_MAGIC:
+        
             return  # can't shift bsdiff
         count = struct.unpack("<I", f.read(4))[0]
 
+    
         for _ in range(count):
             offset = struct.unpack("<Q", f.read(8))[0]
             length = struct.unpack("<I", f.read(4))[0]
             data = f.read(length)
 
             # Adjust offset if past the insertion point
+        
             if offset >= insertion_point:
                 offset += shift
 
             end = offset + length
+        
             if end > len(buf):
                 buf.extend(b"\x00" * (end - len(buf)))
             buf[offset:end] = data
@@ -136,7 +155,7 @@ def _save_range_backup(game_dir: Path, vanilla_dir: Path,
     not-yet-backed-up positions from the current game file (which must
     still be vanilla at those positions, since backups run before apply).
     """
-    game_file = game_dir / file_path.replace("/", "\\")
+    game_file = game_dir / file_path
     if not game_file.exists():
         return
 
@@ -146,36 +165,46 @@ def _save_range_backup(game_dir: Path, vanilla_dir: Path,
     if backup_path.exists():
         # Load existing backup, find ranges not yet covered
         existing = _load_range_backup(vanilla_dir, file_path)
+    
         if existing:
             # Build sorted list of covered intervals for efficient overlap check
             covered_sorted: list[tuple[int, int]] = sorted(
                 (offset, offset + len(data)) for offset, data in existing)
             # Find new ranges not fully covered by any existing interval
             new_ranges: list[tuple[int, int]] = []
+        
             for start, end in merged:
                 is_covered = any(
                     cs <= start and ce >= end for cs, ce in covered_sorted)
+            
                 if not is_covered:
                     new_ranges.append((start, end))
+        
             if not new_ranges:
+            
                 return  # all ranges already backed up
 
             # Read new range data from game file and rebuild backup
             all_entries: list[tuple[int, bytes]] = list(existing)
+        
             with open(game_file, "rb") as f:
+            
                 for start, end in new_ranges:
                     f.seek(start)
                     all_entries.append((start, f.read(end - start)))
 
             # Rebuild backup file with all entries, deduplicating
             seen_offsets: dict[int, bytes] = {}
+        
             for offset, data in all_entries:
+            
                 if offset not in seen_offsets or len(data) > len(seen_offsets[offset]):
                     seen_offsets[offset] = data
             sorted_entries = sorted(seen_offsets.items())
 
             buf = bytearray(SPARSE_MAGIC)
             buf += struct.pack("<I", len(sorted_entries))
+        
             for offset, data in sorted_entries:
                 buf += struct.pack("<QI", offset, len(data))
                 buf += data
@@ -189,6 +218,7 @@ def _save_range_backup(game_dir: Path, vanilla_dir: Path,
     buf += struct.pack("<I", len(merged))
 
     with open(game_file, "rb") as f:
+    
         for start, end in merged:
             length = end - start
             f.seek(start)
@@ -208,10 +238,12 @@ def _load_range_backup(vanilla_dir: Path, file_path: str
     """Load a range backup. Returns [(offset, data), ...] or None."""
     backup_path = vanilla_dir / (file_path.replace("/", "_") + RANGE_BACKUP_EXT)
     if not backup_path.exists():
+    
         return None
 
     raw = backup_path.read_bytes()
     if raw[:4] != SPARSE_MAGIC:
+    
         return None
 
     entries: list[tuple[int, bytes]] = []
@@ -235,6 +267,7 @@ def _apply_ranges_to_buf(buf: bytearray, entries: list[tuple[int, bytes]]) -> No
     """Overwrite byte ranges in a buffer."""
     for file_offset, data in entries:
         end = file_offset + len(data)
+    
         if end > len(buf):
             buf.extend(b"\x00" * (end - len(buf)))
         buf[file_offset:end] = data
@@ -243,10 +276,12 @@ def _apply_ranges_to_buf(buf: bytearray, entries: list[tuple[int, bytes]]) -> No
 def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge overlapping/adjacent byte ranges."""
     if not ranges:
+    
         return []
     sorted_r = sorted(ranges)
     merged = [sorted_r[0]]
     for start, end in sorted_r[1:]:
+    
         if start <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
@@ -270,10 +305,13 @@ def _apply_pamt_entry_update(data: bytearray, update: dict) -> None:
     if new_paz_size is not None:
         paz_count = struct.unpack_from("<I", data, 4)[0]
         paz_index = entry.paz_index
+    
         if paz_index < paz_count:
             table_off = 16
+        
             for i in range(paz_index):
                 table_off += 8
+            
                 if i < paz_count - 1:
                     table_off += 4
             size_off = table_off + 4  # skip hash, point to size
@@ -285,12 +323,12 @@ def _apply_pamt_entry_update(data: bytearray, update: dict) -> None:
                          paz_index, old_size, final_size)
 
     # Find and update the file record (20 bytes: node_ref + offset + comp + orig + flags)
-    search = struct.pack("<IIII", entry.offset, entry.comp_size,
-                         entry.orig_size, entry.flags)
+    search = make_pamt_search_pattern(entry)
     pos = data.find(search)
     if pos >= 4:  # at least 4 bytes for node_ref
         struct.pack_into("<I", data, pos, new_offset)
         struct.pack_into("<I", data, pos + 4, new_comp)
+    
         if new_orig != entry.orig_size:
             struct.pack_into("<I", data, pos + 8, new_orig)
         logger.debug("Patched PAMT record for %s: offset %d->%d, comp %d->%d",
@@ -317,6 +355,7 @@ class ApplyWorker(QObject):
         self._db_path = db_path
 
     def run(self) -> None:
+    
         try:
             self._db = Database(self._db_path)
             self._db.initialize()
@@ -330,6 +369,7 @@ class ApplyWorker(QObject):
         file_deltas = self._get_file_deltas()
         revert_files = self._get_files_to_revert(set(file_deltas.keys()))
 
+    
         if not file_deltas and not revert_files:
             self.error_occurred.emit("No mod changes to apply or revert.")
             return
@@ -340,7 +380,9 @@ class ApplyWorker(QObject):
 
         # Also ensure PAMTs are backed up for directories with entry deltas
         entry_pamt_dirs = set()
+    
         for file_path, deltas in file_deltas.items():
+        
             if any(d.get("entry_path") for d in deltas):
                 entry_pamt_dirs.add(file_path.split("/")[0])
 
@@ -351,25 +393,32 @@ class ApplyWorker(QObject):
         # Ensure vanilla backups exist BEFORE any modifications.
         # Skip if all backups already exist (common case after first apply).
         needs_backup = False
+    
         for file_path in all_files:
             delta_infos = file_deltas.get(file_path, [])
+        
             if all(d.get("is_new") for d in delta_infos) and delta_infos:
+            
                 continue
-            full_path = self._vanilla_dir / file_path.replace("/", "\\")
+            full_path = self._vanilla_dir / file_path
             range_path = self._vanilla_dir / (file_path.replace("/", "_") + RANGE_BACKUP_EXT)
+        
             if not full_path.exists() and not range_path.exists():
                 needs_backup = True
+            
                 break
 
+    
         if needs_backup:
             self.progress_updated.emit(2, "Backing up vanilla files...")
             self._ensure_backups(file_deltas, revert_files)
         # Ensure PAMT backups for directories with entry-level deltas
+    
         for pamt_dir in entry_pamt_dirs:
             pamt_path = f"{pamt_dir}/0.pamt"
-            full_path = self._vanilla_dir / pamt_path.replace("/", "\\")
+            full_path = self._vanilla_dir / pamt_path        
             if not full_path.exists():
-                game_pamt = self._game_dir / pamt_path.replace("/", "\\")
+                game_pamt = self._game_dir / pamt_path            
                 if game_pamt.exists():
                     full_path.parent.mkdir(parents=True, exist_ok=True)
                     _backup_copy(game_pamt, full_path)
@@ -380,55 +429,72 @@ class ApplyWorker(QObject):
         txn = TransactionalIO(self._game_dir, staging_dir)
         modified_pamts: dict[str, bytes] = {}
 
+    
         try:
             file_idx = 0
 
             # ── Phase 1: Compose PAZ and other non-PAMT files ──────────
+        
             for file_path, deltas in file_deltas.items():
                 pct = int((file_idx / total_files) * 60)
                 self.progress_updated.emit(pct, f"Processing {file_path}...")
                 file_idx += 1
 
                 # Skip PAPGT (rebuilt at end) and PAMT (Phase 2)
+            
                 if file_path == "meta/0.papgt":
+                
                     continue
+            
                 if file_path.endswith(".pamt"):
+                
                     continue
 
                 # New files: copy from stored full file (last mod wins)
                 new_deltas = [d for d in deltas if d.get("is_new")]
                 mod_deltas = [d for d in deltas if not d.get("is_new")]
 
+            
                 if new_deltas and not mod_deltas:
                     src = Path(new_deltas[-1]["delta_path"])
+                
                     if src.exists():
                         result_bytes = src.read_bytes()
                         txn.stage_file(file_path, result_bytes)
                         logger.info("Applying new file: %s from %s",
                                     file_path, new_deltas[-1]["mod_name"])
+                
                     continue
 
                 # Fast-track: single mod with FULL_COPY delta — stream-copy
                 # directly instead of loading 900MB+ into memory
+            
                 if len(mod_deltas) == 1 and not mod_deltas[0].get("entry_path"):
                     dp = Path(mod_deltas[0]["delta_path"])
+                
                     try:
+                    
                         with open(dp, "rb") as f:
                             magic = f.read(4)
+                    
                         if magic == b"FULL" and dp.stat().st_size > 50 * 1024 * 1024:
                             # Stream the FULL_COPY content directly to staging
+                        
                             with open(dp, "rb") as f:
                                 f.seek(4)  # skip FULL magic
                                 result_bytes = f.read()
                             txn.stage_file(file_path, result_bytes)
                             logger.info("Fast-track apply: %s (%.1f MB)",
                                         file_path, len(result_bytes) / 1048576)
+                        
                             continue
                     except OSError:
                         pass
 
                 result_bytes = self._compose_file(file_path, mod_deltas)
+            
                 if result_bytes is None:
+                
                     continue
 
                 txn.stage_file(file_path, result_bytes)
@@ -437,12 +503,16 @@ class ApplyWorker(QObject):
             # ── Phase 2: Compose PAMT files (entry updates + byte deltas) ──
             # Collect all PAMTs that need processing
             pamt_paths = set()
+        
             for fp in file_deltas:
+            
                 if fp.endswith(".pamt"):
                     pamt_paths.add(fp)
+        
             for pamt_dir in self._pamt_entry_updates:
                 pamt_paths.add(f"{pamt_dir}/0.pamt")
 
+        
             for pamt_path in sorted(pamt_paths):
                 pct = int((file_idx / total_files) * 80)
                 self.progress_updated.emit(pct, f"Processing {pamt_path}...")
@@ -452,25 +522,32 @@ class ApplyWorker(QObject):
                 byte_deltas = file_deltas.get(pamt_path, [])
                 # Filter out entry_path deltas (shouldn't be on PAMT, but be safe)
                 byte_deltas = [d for d in byte_deltas
+                           
                                if not d.get("entry_path") and not d.get("is_new")]
 
                 new_pamt_deltas = [d for d in file_deltas.get(pamt_path, [])
+                               
                                    if d.get("is_new")]
 
                 entry_updates = self._pamt_entry_updates.get(pamt_dir, [])
 
+            
                 if new_pamt_deltas and not byte_deltas and not entry_updates:
                     # Purely new PAMT — use last copy
                     src = Path(new_pamt_deltas[-1]["delta_path"])
+                
                     if src.exists():
                         result_bytes = src.read_bytes()
                         txn.stage_file(pamt_path, result_bytes)
                         modified_pamts[pamt_dir] = result_bytes
+                
                     continue
 
                 result_bytes = self._compose_pamt(
                     pamt_path, pamt_dir, byte_deltas, entry_updates)
+            
                 if result_bytes is None:
+                
                     continue
 
                 txn.stage_file(pamt_path, result_bytes)
@@ -478,30 +555,38 @@ class ApplyWorker(QObject):
 
             # ── Phase 3: Revert files from disabled mods ───────────────
             new_files_to_delete = self._get_new_files_to_delete(set(file_deltas.keys()))
+        
             for file_path in revert_files:
                 pct = int((file_idx / total_files) * 80)
                 self.progress_updated.emit(pct, f"Reverting {file_path}...")
                 file_idx += 1
 
+            
                 if file_path in new_files_to_delete:
-                    game_path = self._game_dir / file_path.replace("/", "\\")
+                    game_path = self._game_dir / file_path                
                     if game_path.exists():
                         game_path.unlink()
                         logger.info("Deleted new file from disabled mod: %s", file_path)
                     parent = game_path.parent
+                
                     if parent != self._game_dir and parent.exists():
                         remaining = list(parent.iterdir())
+                    
                         if not remaining:
                             parent.rmdir()
                             logger.info("Removed empty mod directory: %s", parent.name)
+                
                     continue
 
                 vanilla_bytes = self._get_vanilla_bytes(file_path)
+            
                 if vanilla_bytes is None:
                     logger.warning("Cannot revert %s — no backup", file_path)
+                
                     continue
 
                 txn.stage_file(file_path, vanilla_bytes)
+            
                 if file_path.endswith(".pamt"):
                     modified_pamts[file_path.split("/")[0]] = vanilla_bytes
 
@@ -510,34 +595,49 @@ class ApplyWorker(QObject):
             # them without recording a delta (e.g., PAMT PAZ size updates).
             # Scan all files with vanilla backups and restore any that differ
             # from the snapshot but aren't managed by an enabled mod.
+        
             if not file_deltas:  # only when reverting everything
+            
                 try:
                     import os
                     from cdumm.engine.snapshot_manager import hash_file, hash_matches
                     snap_cursor = self._db.connection.execute(
                         "SELECT file_path, file_hash, file_size FROM snapshots")
                     already_staged = set(txn.staged_files()) if hasattr(txn, 'staged_files') else set()
+                
                     for rel, snap_hash, snap_size in snap_cursor.fetchall():
+                    
                         if rel == "meta/0.papgt":
+                        
                             continue  # handled in Phase 4
+                    
                         if rel in already_staged:
+                        
                             continue  # already being reverted
                         game_file = self._game_dir / rel.replace("/", os.sep)
+                    
                         if not game_file.exists():
+                        
                             continue
+                    
                         try:
                             actual_size = game_file.stat().st_size
                             needs_restore = False
+                        
                             if actual_size != snap_size:
                                 needs_restore = True
                             elif actual_size < 50 * 1024 * 1024:
                                 # Small file — quick hash check
+                            
                                 if not hash_matches(game_file, snap_hash):
                                     needs_restore = True
+                        
                             if needs_restore:
                                 vanilla = self._get_vanilla_bytes(rel)
+                            
                                 if vanilla:
                                     txn.stage_file(rel, vanilla)
+                                
                                     if rel.endswith(".pamt"):
                                         modified_pamts[rel.split("/")[0]] = vanilla
                                     logger.info("Safety net: restored orphan %s", rel)
@@ -556,20 +656,26 @@ class ApplyWorker(QObject):
             # (e.g. 0043), so it's stale and would break other mods.
             papgt_deltas = file_deltas.get("meta/0.papgt", [])
             mod_papgt_data = None
+        
             if papgt_deltas:
                 # Check if the mod that ships PAPGT was remapped
                 # by looking at whether its other files use the directory
                 # referenced in its PAPGT or a different (remapped) one.
                 use_mod_papgt = True
+            
                 for d in papgt_deltas:
                     dp = d.get("delta_path")
+                
                     if not dp:
+                    
                         continue
                     # Find which mod this PAPGT belongs to
                     mod_row = self._db.connection.execute(
                         "SELECT mod_id FROM mod_deltas WHERE delta_path = ? LIMIT 1",
                         (dp,)).fetchone()
+                
                     if not mod_row:
+                    
                         continue
                     # Get the mod's actual file paths (non-PAPGT)
                     mod_files = self._db.connection.execute(
@@ -579,15 +685,19 @@ class ApplyWorker(QObject):
                     mod_dirs = {f[0].split("/")[0] for f in mod_files}
                     # If any mod dir is >= 0036 and NOT 0036, the mod was remapped
                     has_remapped = any(
-                        d.isdigit() and len(d) == 4 and int(d) >= 36 and d != "0036"
+                        is_mod_dir(d) and d != "0036"
+                    
                         for d in mod_dirs
                     )
+                
                     if has_remapped:
                         use_mod_papgt = False
                         logger.info("Skipping mod-shipped PAPGT — mod was remapped "
                                     "(dirs: %s)", mod_dirs)
+                    
                         break
 
+            
                 if use_mod_papgt:
                     # Don't use mod PAPGT as the full rebuild base.
                     # Mod-shipped PAPGTs often have string table formats that
@@ -600,36 +710,51 @@ class ApplyWorker(QObject):
             # Clean up orphan mod directories (0036+) not used by any enabled mod.
             # Must happen before PAPGT rebuild so orphans aren't re-added.
             enabled_dirs = set()
+        
             for fp in file_deltas:
                 d = fp.split("/")[0]
-                if d.isdigit() and len(d) == 4 and int(d) >= 36:
+            
+                if is_mod_dir(d):
                     enabled_dirs.add(d)
             # Also include new files from enabled mods
+        
             for fp, deltas in file_deltas.items():
+            
                 for d in deltas:
+                
                     if d.get("is_new"):
                         mod_dir = fp.split("/")[0]
-                        if mod_dir.isdigit() and len(mod_dir) == 4:
+                    
+                        if is_paz_dir(mod_dir):
                             enabled_dirs.add(mod_dir)
 
+        
             for d in sorted(self._game_dir.iterdir()):
-                if not d.is_dir() or not d.name.isdigit() or len(d.name) != 4:
+            
+                if not d.is_dir() or not is_paz_dir(d.name):
+                
                     continue
+            
                 if int(d.name) < 36:
+                
                     continue
+            
                 if d.name in enabled_dirs:
+                
                     continue
                 # Check if directory is in snapshot (vanilla)
                 snap_check = self._db.connection.execute(
                     "SELECT COUNT(*) FROM snapshots WHERE file_path LIKE ?",
                     (d.name + "/%",),
                 ).fetchone()[0]
+            
                 if snap_check == 0:
                     import shutil
                     shutil.rmtree(d, ignore_errors=True)
                     logger.info("Cleaned up orphan directory during apply: %s", d.name)
 
             papgt_mgr = PapgtManager(self._game_dir, self._vanilla_dir)
+        
             try:
                 papgt_bytes = papgt_mgr.rebuild(modified_pamts)
                 txn.stage_file("meta/0.papgt", papgt_bytes)
@@ -659,16 +784,21 @@ class ApplyWorker(QObject):
         # Always back up PAPGT — it's rebuilt on every Apply and the rebuild
         # produces different bytes from vanilla. Need the original for Revert.
         papgt_backup = self._vanilla_dir / "meta" / "0.papgt"
+    
         if not papgt_backup.exists():
             game_papgt = self._game_dir / "meta" / "0.papgt"
+        
             if game_papgt.exists():
                 # Validate against snapshot before backing up
                 snap = self._db.connection.execute(
                     "SELECT file_hash, file_size FROM snapshots WHERE file_path = ?",
                     ("meta/0.papgt",)).fetchone()
+            
                 if snap:
+                
                     try:
                         actual_size = game_papgt.stat().st_size
+                    
                         if actual_size == snap[1]:
                             papgt_backup.parent.mkdir(parents=True, exist_ok=True)
                             _backup_copy(game_papgt, papgt_backup)
@@ -678,20 +808,25 @@ class ApplyWorker(QObject):
 
         # Load snapshot hashes for validation
         snap_hashes: dict[str, tuple[str, int]] = {}
+    
         try:
             cursor = self._db.connection.execute(
                 "SELECT file_path, file_hash, file_size FROM snapshots")
+        
             for rel, h, s in cursor.fetchall():
                 snap_hashes[rel] = (h, s)
         except Exception:
             pass
 
         all_files = set(file_deltas.keys()) | set(revert_files)
+    
         for file_path in all_files:
             delta_infos = file_deltas.get(file_path, [])
 
             # Skip new files — no vanilla version to back up
+        
             if all(d.get("is_new") for d in delta_infos) and delta_infos:
+            
                 continue
 
             # PAMT files always get full backups — they're small (<14MB)
@@ -703,19 +838,22 @@ class ApplyWorker(QObject):
             is_loose = file_path not in snap_hashes and not _GAME_FILE_RE.match(file_path)
             needs_full = has_bsdiff or file_path.endswith(".pamt") or is_loose
 
+        
             if needs_full:
-                full_path = self._vanilla_dir / file_path.replace("/", "\\")
+                full_path = self._vanilla_dir / file_path            
                 if not full_path.exists():
-                    game_path = self._game_dir / file_path.replace("/", "\\")
+                    game_path = self._game_dir / file_path                
                     if game_path.exists():
                         # For loose files not in the snapshot, skip hash validation
                         # and back them up unconditionally (no vanilla reference).
+                    
                         if not is_loose and not self._verify_is_vanilla(
                                 game_path, file_path, snap_hashes):
                             logger.warning(
                                 "Skipping backup of %s — file doesn't match snapshot "
                                 "(may be modded). Revert will use range backup or "
                                 "require Steam verify.", file_path)
+                        
                             continue
                         full_path.parent.mkdir(parents=True, exist_ok=True)
                         _backup_copy(game_path, full_path)
@@ -723,6 +861,7 @@ class ApplyWorker(QObject):
             else:
                 # Byte-range backup — only the positions mods touch
                 ranges = self._get_all_byte_ranges(file_path)
+            
                 if ranges:
                     _save_range_backup(
                         self._game_dir, self._vanilla_dir, file_path, ranges)
@@ -731,27 +870,38 @@ class ApplyWorker(QObject):
                            snap_hashes: dict[str, tuple[str, int]]) -> bool:
         """Check if a game file matches its snapshot hash (is truly vanilla)."""
         snap = snap_hashes.get(file_path)
+    
         if snap is None:
+        
             return False  # not in snapshot = not a vanilla file
 
         snap_hash, snap_size = snap
         # Quick size check first
+    
         try:
+        
             if game_path.stat().st_size != snap_size:
+            
                 return False
         except OSError:
+        
             return False
 
         # Full hash check for small files (<50MB). For large files, trust
         # the size match — hashing 900MB PAZ on every apply is too slow.
+    
         if snap_size < 50 * 1024 * 1024:
             from cdumm.engine.snapshot_manager import hash_file
+        
             try:
                 current_hash, _ = hash_file(game_path)
+            
                 return current_hash == snap_hash
             except Exception:
+            
                 return False
 
+    
         return True  # large file, size matches
 
     def _has_bsdiff_delta(self, file_path: str,
@@ -763,18 +913,28 @@ class ApplyWorker(QObject):
         query + file read only for revert-only files (where delta_infos is None).
         """
         # Fast path: use already-loaded delta metadata
+    
         if delta_infos:
+        
             for d in delta_infos:
                 dp = d.get("delta_path")
+            
                 if not dp:
+                
                     continue
+            
                 try:
+                
                     with open(dp, "rb") as f:
                         magic = f.read(4)
+                
                     if magic not in (SPARSE_MAGIC, b"ENTR"):
+                    
                         return True
                 except OSError:
+                
                     continue
+        
             return False
 
         # Fallback: DB query for revert-only files (no pre-loaded delta_infos)
@@ -784,14 +944,21 @@ class ApplyWorker(QObject):
             "WHERE md.file_path = ? AND m.mod_type = 'paz'",
             (file_path,),
         )
+    
         for (delta_path,) in cursor.fetchall():
+        
             try:
+            
                 with open(delta_path, "rb") as f:
                     magic = f.read(4)
+            
                 if magic not in (SPARSE_MAGIC, b"ENTR"):
+                
                     return True
             except OSError:
+            
                 continue
+    
         return False
 
     def _get_all_byte_ranges(self, file_path: str) -> list[tuple[int, int]]:
@@ -801,6 +968,7 @@ class ApplyWorker(QObject):
             "WHERE file_path = ? AND byte_start IS NOT NULL",
             (file_path,),
         )
+    
         return [(row[0], row[1]) for row in cursor.fetchall()]
 
     def _compose_file(self, file_path: str, deltas: list[dict]) -> bytes | None:
@@ -833,17 +1001,19 @@ class ApplyWorker(QObject):
         byte_deltas = [d for d in remaining_deltas if not d.get("entry_path")]
 
         # Get vanilla content
-        full_vanilla = self._vanilla_dir / file_path.replace("/", "\\")
+        full_vanilla = self._vanilla_dir / file_path    
         if full_vanilla.exists():
             current = full_vanilla.read_bytes()
         else:
-            game_path = self._game_dir / file_path.replace("/", "\\")
+            game_path = self._game_dir / file_path        
             if not game_path.exists():
                 logger.warning("Game file not found: %s", file_path)
+            
                 return None
 
             current_buf = bytearray(game_path.read_bytes())
             range_entries = _load_range_backup(self._vanilla_dir, file_path)
+        
             if range_entries:
                 _apply_ranges_to_buf(current_buf, range_entries)
             current = bytes(current_buf)
@@ -851,12 +1021,15 @@ class ApplyWorker(QObject):
         vanilla_size = len(current)
 
         # ── Entry-level deltas (script mods) ───────────────────────
+    
         if entry_deltas:
             current = self._apply_entry_deltas(
                 file_path, bytearray(current), entry_deltas)
 
         # ── Byte-level deltas (zip/JSON/legacy mods) ───────────────
+    
         if not byte_deltas:
+        
             return current
 
         # Classify byte deltas by type
@@ -864,14 +1037,19 @@ class ApplyWorker(QObject):
         sprs_shifted = []
         size_preserving = []
 
+    
         for d in byte_deltas:
             dp = Path(d["delta_path"])
+        
             try:
+            
                 with open(dp, "rb") as f:
                     magic = f.read(4)
             except OSError:
+            
                 continue
 
+        
             if magic == b"FULL" or (magic == b"BSDI"):
                 full_replace.append(d)
             elif _delta_changes_size(dp, vanilla_size):
@@ -880,40 +1058,51 @@ class ApplyWorker(QObject):
                 size_preserving.append(d)
 
         # Step 1: Apply full-replace deltas (last one wins if multiple)
+    
         for d in full_replace:
             current = apply_delta_from_file(current, Path(d["delta_path"]))
             logger.info("Applied full-replace delta for %s from %s",
                         file_path, d.get("mod_name", "?"))
 
         # Step 2: Apply SPRS deltas that shift file size
+    
         for d in sprs_shifted:
             current = apply_delta_from_file(current, Path(d["delta_path"]))
 
+    
         if not size_preserving:
+        
             return current
 
         # Step 3: Apply same-size SPRS patches on top
         shift = len(current) - vanilla_size
+    
         if shift != 0 and (full_replace or sprs_shifted):
+        
             if sprs_shifted:
                 insertion_point = _find_insertion_point(
                     Path(sprs_shifted[0]["delta_path"]))
             else:
                 insertion_point = vanilla_size
 
+        
             if insertion_point < vanilla_size:
                 logger.info(
                     "PAZ shift detected: %+d bytes at offset %d, "
                     "adjusting %d remaining delta(s)",
                     shift, insertion_point, len(size_preserving))
                 result = bytearray(current)
+            
                 for d in size_preserving:
                     _apply_sparse_shifted(
                         result, Path(d["delta_path"]), insertion_point, shift)
+            
                 return bytes(result)
 
+    
         for d in size_preserving:
             current = apply_delta_from_file(current, Path(d["delta_path"]))
+    
         return current
 
     def _merge_json_patch_deltas(
@@ -949,28 +1138,37 @@ class ApplyWorker(QObject):
 
         # Collect json_patches info (fast path)
         patches_by_game_file: dict[str, list[tuple[dict, dict]]] = {}
+    
         for d in deltas:
             jp = d.get("json_patches")
+        
             if not jp:
+            
                 continue
+        
             try:
                 patch_info = json.loads(jp)
                 game_file = patch_info.get("entry_path") or patch_info.get("game_file")
+            
                 if game_file:
                     patches_by_game_file.setdefault(game_file, []).append(
                         (d, patch_info))
             except (json.JSONDecodeError, TypeError):
+            
                 continue
 
         # Check for fast-path merges (2+ mods with json_patches for same file)
         fast_merges = {gf: patches for gf, patches in patches_by_game_file.items()
+                   
                        if len(patches) >= 2}
 
         # Check for fallback merges: 2+ mods with overlapping byte ranges
         # but no json_patches data. Group by byte range overlap.
         fallback_groups = self._find_overlapping_delta_groups(deltas, fast_merges)
 
+    
         if not fast_merges and not fallback_groups:
+        
             return [], deltas
 
         from cdumm.engine.json_patch_handler import _find_pamt_entry, _extract_from_paz
@@ -978,11 +1176,15 @@ class ApplyWorker(QObject):
         deltas_to_exclude: set[str] = set()
 
         # ── Fast path: merge using stored JSON patch data ──
+    
         for game_file, mod_patches in fast_merges.items():
             entry = _find_pamt_entry(game_file, base_dir)
+        
             if not entry:
+            
                 continue
 
+        
             try:
                 van_paz = base_dir / pamt_dir / f"{entry.paz_index}.paz"
                 van_entry = PazEntry(
@@ -995,6 +1197,7 @@ class ApplyWorker(QObject):
             except Exception as e:
                 logger.warning("JSON merge: can't extract vanilla %s: %s",
                                game_file, e)
+            
                 continue
 
             # Apply all patches in priority order: highest priority number first,
@@ -1002,18 +1205,24 @@ class ApplyWorker(QObject):
             # number, same convention as SPRS patches) wins any overlap.
             merged = bytearray(vanilla_content)
             mod_names = []
+        
             for d, patch_info in mod_patches:
+            
                 for change in patch_info.get("changes", []):
                     offset = change.get("offset", 0)
+                
                     try:
                         patched = bytes.fromhex(change.get("patched", ""))
+                    
                         if offset + len(patched) <= len(merged):
                             merged[offset:offset + len(patched)] = patched
                     except (ValueError, IndexError):
+                    
                         continue
                 mod_names.append(d.get("mod_name", "?"))
                 deltas_to_exclude.add(d["delta_path"])
 
+        
             if bytes(merged) != vanilla_content:
                 merged_deltas.append(self._make_merged_entry(
                     entry, pamt_dir, bytes(merged), mod_names))
@@ -1021,15 +1230,19 @@ class ApplyWorker(QObject):
                             game_file, ", ".join(mod_names))
 
         # ── Fallback: derive patches by diffing each mod's result vs vanilla ──
+    
         for entry_key, group_deltas in fallback_groups.items():
             # entry_key is (pamt_dir, approximate_offset)
             # All deltas in the group overlap at roughly the same PAZ region.
             # Find which PAMT entry they target by parsing the PAMT.
             entry = self._find_entry_at_offset(
                 pamt_dir, group_deltas[0], base_dir)
+        
             if not entry:
+            
                 continue
 
+        
             try:
                 van_paz = base_dir / pamt_dir / f"{entry.paz_index}.paz"
                 van_entry = PazEntry(
@@ -1042,13 +1255,17 @@ class ApplyWorker(QObject):
             except Exception as e:
                 logger.warning("JSON merge fallback: can't extract %s: %s",
                                entry.path, e)
+            
                 continue
 
             # Get vanilla PAZ bytes to apply each mod's delta independently
             van_paz_path = base_dir / pamt_dir / f"{entry.paz_index}.paz"
+        
             if not van_paz_path.exists():
                 van_paz_path = self._game_dir / pamt_dir / f"{entry.paz_index}.paz"
+        
             if not van_paz_path.exists():
+            
                 continue
             vanilla_paz = van_paz_path.read_bytes()
 
@@ -1060,7 +1277,9 @@ class ApplyWorker(QObject):
 
             # Apply lowest priority first (high-priority DESC order — iterate as-is;
             # last write wins — so top-of-list mod wins, same as SPRS patches)
+        
             for d in group_deltas:
+            
                 try:
                     mod_paz = apply_delta_from_file(
                         vanilla_paz, Path(d["delta_path"]))
@@ -1079,7 +1298,9 @@ class ApplyWorker(QObject):
                     mod_content = decompress_entry(raw, entry)
 
                     # Three-way merge: only apply bytes that THIS mod changed
+                
                     for i in range(min(len(vanilla_content), len(mod_content))):
+                    
                         if mod_content[i] != vanilla_content[i]:
                             merged[i] = mod_content[i]
 
@@ -1088,8 +1309,10 @@ class ApplyWorker(QObject):
                 except Exception as e:
                     logger.debug("JSON merge fallback: failed for %s: %s",
                                  d.get("mod_name", "?"), e)
+                
                     continue
 
+        
             if len(mod_names) >= 2 and bytes(merged) != vanilla_content:
                 merged_deltas.append(self._make_merged_entry(
                     entry, pamt_dir, bytes(merged), mod_names))
@@ -1097,11 +1320,13 @@ class ApplyWorker(QObject):
                             entry.path, ", ".join(mod_names))
 
         remaining = [d for d in deltas if d["delta_path"] not in deltas_to_exclude]
+    
         return merged_deltas, remaining
 
     def _make_merged_entry(self, entry, pamt_dir: str,
                            content: bytes, mod_names: list[str]) -> dict:
         """Create a synthetic ENTR-style delta dict for merged content."""
+    
         return {
             "entry_path": entry.path,
             "delta_path": None,
@@ -1130,26 +1355,36 @@ class ApplyWorker(QObject):
         """
         # Skip deltas already handled by fast-path or that have entry_path
         already_files = set()
+    
         for gf, patches in already_merged.items():
+        
             for d, _ in patches:
                 already_files.add(d["delta_path"])
 
         # Collect candidate delta paths for a single batched DB query.
         candidate_paths = []
         candidate_deltas = []
+    
         for d in deltas:
+        
             if d["delta_path"] in already_files:
+            
                 continue
+        
             if d.get("entry_path") or d.get("is_new") or d.get("json_patches"):
+            
                 continue
             candidate_paths.append(d["delta_path"])
             candidate_deltas.append(d)
 
+    
         if len(candidate_paths) < 2:
+        
             return {}
 
         # Batch-fetch byte ranges for all candidates in one query.
         placeholders = ",".join("?" * len(candidate_paths))
+    
         try:
             rows = self._db.connection.execute(
                 f"SELECT delta_path, byte_start, byte_end FROM mod_deltas "
@@ -1157,6 +1392,7 @@ class ApplyWorker(QObject):
                 candidate_paths,
             ).fetchall()
         except Exception:
+        
             return {}
         range_by_path = {r[0]: (r[1], r[2]) for r in rows}
 
@@ -1164,22 +1400,32 @@ class ApplyWorker(QObject):
         # Skip FULL_COPY deltas — they replace the entire file and are handled
         # correctly by _compose_file's standard full_replace logic.
         range_deltas = []
+    
         for d in candidate_deltas:
             dp = d["delta_path"]
+        
             if dp not in range_by_path:
+            
                 continue
             # Skip FULL_COPY deltas (magic check)
+        
             try:
+            
                 with open(dp, "rb") as f:
                     magic = f.read(4)
+            
                 if magic == b"FULL":
+                
                     continue
             except Exception:
+            
                 continue
             bs, be = range_by_path[dp]
             range_deltas.append((bs, be, d))
 
+    
         if len(range_deltas) < 2:
+        
             return {}
 
         # Find overlapping pairs
@@ -1187,33 +1433,44 @@ class ApplyWorker(QObject):
         groups: dict[int, list[dict]] = {}
         used = set()
 
+    
         for i in range(len(range_deltas)):
+        
             if i in used:
+            
                 continue
             s1, e1, d1 = range_deltas[i]
             group = [d1]
             group_id = i
+        
             for j in range(i + 1, len(range_deltas)):
+            
                 if j in used:
+                
                     continue
                 s2, e2, d2 = range_deltas[j]
+            
                 if s2 < e1:  # overlap
                     group.append(d2)
                     used.add(j)
                     e1 = max(e1, e2)
+        
             if len(group) >= 2:
                 used.add(i)
                 groups[s1] = group
 
         # Convert to keyed format
         pamt_dir = ""
+    
         if groups:
             pamt_dir = list(groups.values())[0][0].get("delta_path", "").split("/")[-1]
             # Actually get from file_path
         result = {}
+    
         for offset, grp in groups.items():
             result[("", offset)] = grp
 
+    
         return result
 
     def _find_entry_at_offset(self, pamt_dir: str, delta: dict,
@@ -1221,25 +1478,34 @@ class ApplyWorker(QObject):
         """Find the PAMT entry whose compressed data occupies a given PAZ offset."""
         from cdumm.archive.paz_parse import parse_pamt
 
+    
         try:
             row = self._db.connection.execute(
                 "SELECT byte_start, byte_end FROM mod_deltas WHERE delta_path = ? LIMIT 1",
                 (delta["delta_path"],)).fetchone()
+        
             if not row or row[0] is None:
+            
                 return None
             target_offset = row[0]
 
             pamt_path = base_dir / pamt_dir / "0.pamt"
+        
             if not pamt_path.exists():
+            
                 return None
 
             entries = parse_pamt(str(pamt_path), str(base_dir / pamt_dir))
             # Find entry whose offset range contains our target
+        
             for e in entries:
+            
                 if e.offset <= target_offset < e.offset + e.comp_size:
+                
                     return e
         except Exception as e:
             logger.debug("Failed to find entry at offset: %s", e)
+    
         return None
 
     def _apply_entry_deltas(self, file_path: str, buf: bytearray,
@@ -1260,22 +1526,28 @@ class ApplyWorker(QObject):
 
         # Group by entry_path — last mod (highest priority in sorted order) wins
         by_entry: dict[str, dict] = {}
+    
         for d in entry_deltas:
             by_entry[d["entry_path"]] = d
 
+    
         for entry_path, d in by_entry.items():
             # Support both on-disk ENTR deltas and in-memory merged content
+        
             if d.get("_merged_content") is not None:
                 content = d["_merged_content"]
                 metadata = d["_merged_metadata"]
             elif d.get("delta_path"):
+            
                 try:
                     content, metadata = load_entry_delta(Path(d["delta_path"]))
                 except Exception as e:
                     logger.warning("Failed to load entry delta %s: %s",
                                    d["delta_path"], e)
+                
                     continue
             else:
+            
                 continue
 
             entry = PazEntry(
@@ -1289,16 +1561,19 @@ class ApplyWorker(QObject):
                 _encrypted_override=metadata.get("encrypted"),
             )
 
+        
             try:
                 payload, actual_comp, actual_orig = repack_entry_bytes(
                     content, entry, allow_size_change=True)
             except Exception as e:
                 logger.warning("Failed to repack entry %s: %s", entry_path, e)
+            
                 continue
 
             new_offset = entry.offset
             new_paz_size = None
 
+        
             if actual_comp > entry.comp_size:
                 # Doesn't fit — append to end of PAZ
                 new_offset = len(buf)
@@ -1322,6 +1597,7 @@ class ApplyWorker(QObject):
             logger.info("Applied entry delta: %s in %s from %s",
                         entry_path, file_path, d.get("mod_name", "?"))
 
+    
         return bytes(buf)
 
     def _compose_pamt(self, pamt_path: str, pamt_dir: str,
@@ -1333,23 +1609,28 @@ class ApplyWorker(QObject):
         Byte deltas come from non-script mods that modify the PAMT directly.
         """
         vanilla = self._get_vanilla_bytes(pamt_path)
+    
         if vanilla is None:
-            game_path = self._game_dir / pamt_path.replace("/", "\\")
+            game_path = self._game_dir / pamt_path        
             if game_path.exists():
                 vanilla = game_path.read_bytes()
             else:
                 logger.warning("PAMT not found: %s", pamt_path)
+            
                 return None
 
         buf = bytearray(vanilla)
 
         # Apply entry-level PAMT updates (from PAZ entry composition)
+    
         for update in entry_updates:
             _apply_pamt_entry_update(buf, update)
 
         # Apply byte-level PAMT deltas on top (from zip/JSON mods)
+    
         if byte_deltas:
             current = bytes(buf)
+        
             for d in byte_deltas:
                 current = apply_delta_from_file(current, Path(d["delta_path"]))
             buf = bytearray(current)
@@ -1358,11 +1639,13 @@ class ApplyWorker(QObject):
         from cdumm.archive.hashlittle import compute_pamt_hash
         correct_hash = compute_pamt_hash(bytes(buf))
         stored_hash = struct.unpack_from("<I", buf, 0)[0]
+    
         if stored_hash != correct_hash:
             struct.pack_into("<I", buf, 0, correct_hash)
             logger.info("Recomputed PAMT hash for %s: %08X -> %08X",
                         pamt_path, stored_hash, correct_hash)
 
+    
         return bytes(buf)
 
     def _get_vanilla_bytes(self, file_path: str) -> bytes | None:
@@ -1373,36 +1656,44 @@ class ApplyWorker(QObject):
         (from other mods or manual edits), those leak into the result.
         """
         # Try full backup first
-        full_path = self._vanilla_dir / file_path.replace("/", "\\")
+        full_path = self._vanilla_dir / file_path    
         if full_path.exists():
+        
             return full_path.read_bytes()
 
         # Try range backup — reconstruct vanilla from game file + ranges
-        game_path = self._game_dir / file_path.replace("/", "\\")
+        game_path = self._game_dir / file_path    
         if not game_path.exists():
+        
             return None
 
         range_entries = _load_range_backup(self._vanilla_dir, file_path)
+    
         if range_entries:
             buf = bytearray(game_path.read_bytes())
             _apply_ranges_to_buf(buf, range_entries)
             result = bytes(buf)
             # Verify reconstructed vanilla against snapshot
+        
             try:
                 snap = self._db.connection.execute(
                     "SELECT file_hash FROM snapshots WHERE file_path = ?",
                     (file_path,)).fetchone()
+            
                 if snap:
                     import xxhash
                     h = xxhash.xxh3_128(result).hexdigest()
+                
                     if h != snap[0]:
                         logger.warning(
                             "Range-reconstructed vanilla for %s doesn't match snapshot "
                             "(game file may have untracked modifications)", file_path)
             except Exception:
                 pass
+        
             return result
 
+    
         return None
 
     def _verify_vanilla_files(self, txn, active_files: set[str],
@@ -1417,6 +1708,7 @@ class ApplyWorker(QObject):
         """
         import os
 
+    
         try:
             cursor = self._db.connection.execute(
                 "SELECT file_path, file_hash, file_size FROM snapshots")
@@ -1425,20 +1717,30 @@ class ApplyWorker(QObject):
             return
 
         # Method 1: size mismatch
+    
         for file_path, (snap_hash, snap_size) in snap_map.items():
+        
             if file_path in active_files or file_path == "meta/0.papgt":
+            
                 continue
             game_file = self._game_dir / file_path.replace("/", os.sep)
+        
             if not game_file.exists():
+            
                 continue
+        
             try:
                 actual_size = game_file.stat().st_size
             except OSError:
+            
                 continue
+        
             if actual_size != snap_size:
                 vanilla_bytes = self._get_vanilla_bytes(file_path)
+            
                 if vanilla_bytes:
                     txn.stage_file(file_path, vanilla_bytes)
+                
                     if file_path.endswith(".pamt"):
                         modified_pamts[file_path.split("/")[0]] = vanilla_bytes
                     logger.warning("Restored orphaned file to vanilla: %s "
@@ -1448,36 +1750,51 @@ class ApplyWorker(QObject):
         # Method 2: vanilla backup exists but file isn't actively managed.
         # If we have a backup (range or full) for a file, it was previously
         # modified. If no enabled mod touches it now, restore it.
+    
         if not self._vanilla_dir or not self._vanilla_dir.exists():
             return
+    
         for backup in self._vanilla_dir.rglob("*"):
+        
             if not backup.is_file():
+            
                 continue
             # Determine the game file path from backup path
+        
             if backup.name.endswith(".vranges"):
                 # Range backup: filename is file_path with / replaced by _
                 rel = backup.name[:-len(".vranges")].replace("_", "/")
             else:
                 rel = str(backup.relative_to(self._vanilla_dir)).replace("\\", "/")
 
+        
             if rel in active_files or rel == "meta/0.papgt":
+            
                 continue
+        
             if rel not in snap_map:
+            
                 continue
 
             game_file = self._game_dir / rel.replace("/", os.sep)
+        
             if not game_file.exists():
+            
                 continue
 
             # This file has a backup but no enabled mod manages it — restore
             vanilla_bytes = self._get_vanilla_bytes(rel)
+        
             if vanilla_bytes:
                 snap_hash, snap_size = snap_map[rel]
                 # Only restore if file actually differs from vanilla
+            
                 if len(vanilla_bytes) == snap_size:
                     game_bytes = game_file.read_bytes()
+                
                     if game_bytes != vanilla_bytes:
                         txn.stage_file(rel, vanilla_bytes)
+                    
                         if rel.endswith(".pamt"):
                             modified_pamts[rel.split("/")[0]] = vanilla_bytes
                         logger.warning("Restored orphaned file to vanilla: %s "
@@ -1492,6 +1809,7 @@ class ApplyWorker(QObject):
             "WHERE m.enabled = 0 AND m.mod_type = 'paz'"
         )
         disabled_files = {row[0] for row in cursor.fetchall()}
+    
         return sorted(disabled_files - enabled_files)
 
     def _get_new_files_to_delete(self, enabled_files: set[str]) -> set[str]:
@@ -1504,6 +1822,7 @@ class ApplyWorker(QObject):
         )
         disabled_new = {row[0] for row in cursor.fetchall()}
         # Don't delete if an enabled mod also provides this new file
+    
         return disabled_new - enabled_files
 
     def _get_file_deltas(self) -> dict[str, list[dict]]:
@@ -1520,12 +1839,17 @@ class ApplyWorker(QObject):
         file_deltas: dict[str, list[dict]] = {}
         seen_deltas: set[str] = set()
 
+    
         for file_path, delta_path, mod_name, is_new, entry_path, json_patches in cursor.fetchall():
+        
             if delta_path in seen_deltas:
+            
                 continue
             # Skip deltas whose files are missing (zombie entries from old resets)
+        
             if not Path(delta_path).exists():
                 logger.warning("Skipping missing delta: %s (%s)", delta_path, mod_name)
+            
                 continue
             seen_deltas.add(delta_path)
             d = {
@@ -1533,12 +1857,15 @@ class ApplyWorker(QObject):
                 "mod_name": mod_name,
                 "is_new": bool(is_new),
             }
+        
             if entry_path:
                 d["entry_path"] = entry_path
+        
             if json_patches:
                 d["json_patches"] = json_patches
             file_deltas.setdefault(file_path, []).append(d)
 
+    
         return file_deltas
 
 
@@ -1557,6 +1884,7 @@ class RevertWorker(QObject):
         self._db_path = db_path
 
     def run(self) -> None:
+    
         try:
             self._db = Database(self._db_path)
             self._db.initialize()
@@ -1575,6 +1903,7 @@ class RevertWorker(QObject):
         mod_files = [row[0] for row in rows]
         new_files = {row[0] for row in rows if row[1]}
 
+    
         if not mod_files:
             self.error_occurred.emit("No mod data found. Nothing to revert.")
             return
@@ -1588,21 +1917,26 @@ class RevertWorker(QObject):
 
         reverted = 0
         failed_files: list[str] = []
+    
         try:
+        
             for i, file_path in enumerate(mod_files):
                 pct = int((i / total) * 90)
                 self.progress_updated.emit(pct, f"Restoring {file_path}...")
 
+            
                 if file_path in new_files:
                     # New file — delete it (didn't exist in vanilla)
-                    game_path = self._game_dir / file_path.replace("/", "\\")
+                    game_path = self._game_dir / file_path                
                     if game_path.exists():
                         game_path.unlink()
                         logger.info("Deleted mod-added file: %s", file_path)
                         reverted += 1
+                
                     continue
 
                 vanilla_bytes = self._get_vanilla_bytes(file_path)
+            
                 if vanilla_bytes:
                     txn.stage_file(file_path, vanilla_bytes)
                     reverted += 1
@@ -1610,6 +1944,7 @@ class RevertWorker(QObject):
                     logger.warning("Cannot revert %s — no backup found", file_path)
                     failed_files.append(file_path)
 
+        
             if reverted == 0:
                 self.error_occurred.emit(
                     "No vanilla backups found. Use Steam 'Verify Integrity' to restore.")
@@ -1618,16 +1953,22 @@ class RevertWorker(QObject):
             # Clean up orphan mod directories (0036+) that are empty or
             # only existed because of standalone mods
             self.progress_updated.emit(91, "Cleaning orphan directories...")
+        
             for d in sorted(self._game_dir.iterdir()):
-                if not d.is_dir() or not d.name.isdigit() or len(d.name) != 4:
+            
+                if not d.is_dir() or not is_paz_dir(d.name):
+                
                     continue
+            
                 if int(d.name) < 36:
+                
                     continue
                 # Check if this directory is in the snapshot (vanilla)
                 snap_check = self._db.connection.execute(
                     "SELECT COUNT(*) FROM snapshots WHERE file_path LIKE ?",
                     (d.name + "/%",),
                 ).fetchone()[0]
+            
                 if snap_check == 0:
                     # Not in snapshot — orphan from mods, remove it
                     import shutil
@@ -1645,6 +1986,7 @@ class RevertWorker(QObject):
             ).fetchone()
 
             # Use backup only if its size matches the snapshot (truly vanilla)
+        
             if (vanilla_papgt.exists() and snap_papgt
                     and vanilla_papgt.stat().st_size == snap_papgt[0]):
                 txn.stage_file("meta/0.papgt", vanilla_papgt.read_bytes())
@@ -1652,21 +1994,29 @@ class RevertWorker(QObject):
             else:
                 # Backup is stale or missing — rebuild with only vanilla directories.
                 # Feed vanilla PAMT data so all hashes are correct.
+            
                 if vanilla_papgt.exists() and snap_papgt:
                     logger.info("PAPGT backup stale (size %d != snapshot %d), rebuilding",
                                 vanilla_papgt.stat().st_size, snap_papgt[0])
                 papgt_mgr = PapgtManager(self._game_dir, self._vanilla_dir)
                 vanilla_pamts: dict[str, bytes] = {}
                 # Read all vanilla PAMTs from backed up or game files
+            
                 for d in sorted(self._game_dir.iterdir()):
-                    if not d.is_dir() or not d.name.isdigit() or len(d.name) != 4:
+                
+                    if not d.is_dir() or not is_paz_dir(d.name):
+                    
                         continue
+                
                     if int(d.name) >= 36:
+                    
                         continue  # skip mod directories
                     pamt_path = f"{d.name}/0.pamt"
                     pamt_bytes = self._get_vanilla_bytes(pamt_path)
+                
                     if pamt_bytes:
                         vanilla_pamts[d.name] = pamt_bytes
+            
                 try:
                     papgt_bytes = papgt_mgr.rebuild(
                         modified_pamts=vanilla_pamts if vanilla_pamts else None)
@@ -1679,6 +2029,7 @@ class RevertWorker(QObject):
             self.progress_updated.emit(95, "Committing revert...")
             txn.commit()
 
+        
             if failed_files:
                 self.warning.emit(
                     f"{len(failed_files)} file(s) could not be reverted "
@@ -1697,20 +2048,25 @@ class RevertWorker(QObject):
 
     def _get_vanilla_bytes(self, file_path: str) -> bytes | None:
         """Get vanilla version from full backup or range backup."""
-        full_path = self._vanilla_dir / file_path.replace("/", "\\")
+        full_path = self._vanilla_dir / file_path    
         if full_path.exists():
+        
             return full_path.read_bytes()
 
-        game_path = self._game_dir / file_path.replace("/", "\\")
+        game_path = self._game_dir / file_path    
         if not game_path.exists():
+        
             return None
 
         range_entries = _load_range_backup(self._vanilla_dir, file_path)
+    
         if range_entries:
             buf = bytearray(game_path.read_bytes())
             _apply_ranges_to_buf(buf, range_entries)
+        
             return bytes(buf)
 
+    
         return None
 
 
@@ -1760,9 +2116,11 @@ def revert_mod_direct(
         conn.close()
 
     if conflict_count > 0:
+    
         return False, "byte_range_conflict"
 
     if not rows:
+    
         return True, "No delta data — nothing to revert"
 
     # Collect files that need undoing; track new files for deletion
@@ -1770,16 +2128,20 @@ def revert_mod_direct(
     new_files: set[str] = set()
 
     for file_path, delta_path_str, is_new in rows:
+    
         if is_new:
             new_files.add(file_path)
+        
             continue
         delta_path = Path(delta_path_str)
         undo_path = delta_path.with_suffix(delta_path.suffix + UNDO_SUFFIX)
+    
         if undo_path.exists():
             files_to_undo.setdefault(file_path, []).append(undo_path)
 
     if not files_to_undo and not new_files:
         # No undo files available — signal caller to fall back to Apply-based remove
+    
         return False, "no_undo_files"
 
     errors: list[str] = []
@@ -1787,12 +2149,14 @@ def revert_mod_direct(
 
     # Delete new (mod-added) files first
     for file_path in new_files:
-        game_path = game_dir / file_path.replace("/", "\\")
+        game_path = game_dir / file_path    
         try:
+        
             if game_path.exists():
                 game_path.unlink()
                 # Remove empty parent directory (standalone mod dir)
                 parent = game_path.parent
+            
                 if (parent != game_dir and parent.exists()
                         and not any(parent.iterdir())):
                     parent.rmdir()
@@ -1802,20 +2166,25 @@ def revert_mod_direct(
 
     # Apply undo patches in-place (vanilla bytes back to game files)
     for file_path, undo_paths in files_to_undo.items():
-        game_path = game_dir / file_path.replace("/", "\\")
+        game_path = game_dir / file_path    
         if not game_path.exists():
             logger.warning("revert_mod_direct: game file missing %s", file_path)
+        
             continue
 
+    
         try:
             buf = bytearray(game_path.read_bytes())
+        
             for undo_path in undo_paths:
                 entries = _load_range_backup_from_file(undo_path)
+            
                 if entries:
                     _apply_ranges_to_buf(buf, entries)
             game_path.write_bytes(bytes(buf))
             logger.info("revert_mod_direct: patched %s (%d undo file(s))",
                         file_path, len(undo_paths))
+        
             if file_path.endswith(".pamt") or file_path.endswith(".paz"):
                 papgt_needs_rebuild = True
         except OSError as e:
@@ -1824,6 +2193,7 @@ def revert_mod_direct(
     # Rebuild PAPGT if any PAZ/PAMT was touched
     if papgt_needs_rebuild:
         vanilla_dir = game_dir / "CDMods" / "vanilla"
+    
         try:
             papgt_mgr = PapgtManager(game_dir, vanilla_dir)
             papgt_bytes = papgt_mgr.rebuild(modified_pamts=None)
@@ -1834,6 +2204,7 @@ def revert_mod_direct(
             logger.warning("revert_mod_direct: PAPGT rebuild failed: %s", e)
 
     if errors:
+    
         return False, "Partial revert — some files failed:\n" + "\n".join(errors)
     return True, "ok"
 
@@ -1843,8 +2214,10 @@ def _load_range_backup_from_file(path: Path) -> list[tuple[int, bytes]] | None:
     try:
         raw = path.read_bytes()
     except OSError:
+    
         return None
     if raw[:4] != SPARSE_MAGIC:
+    
         return None
     entries: list[tuple[int, bytes]] = []
     offset = 4

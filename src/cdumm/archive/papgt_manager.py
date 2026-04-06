@@ -22,6 +22,7 @@ import struct
 from pathlib import Path
 
 from cdumm.archive.hashlittle import compute_pamt_hash, compute_papgt_hash
+from cdumm.archive.paz_format import is_paz_dir
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,7 @@ class PapgtManager:
         # Scan for new directories on disk (0036+) not in PAPGT
         try:
             for d in sorted(self._game_dir.iterdir()):
-                if not d.is_dir() or not d.name.isdigit() or len(d.name) != 4:
+                if not d.is_dir() or not is_paz_dir(d.name):
                     continue
                 if int(d.name) < 36:
                     continue  # vanilla directories, already in PAPGT

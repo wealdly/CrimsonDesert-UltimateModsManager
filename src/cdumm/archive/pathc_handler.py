@@ -22,9 +22,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from cdumm.archive.hashlittle import hashlittle
-
-HASH_INITVAL = 0x000C5EDE
+from cdumm.archive.hashlittle import hashlittle, INTEGRITY_SEED as HASH_INITVAL
 
 # Block compression sizes by DDS FourCC
 _BC_BLOCK_BYTES_BY_FOURCC = {
