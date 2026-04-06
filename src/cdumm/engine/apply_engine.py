@@ -496,14 +496,21 @@ class ApplyWorker(QObject):
             # ── Phase 2: Compose PAMT files (entry updates + byte deltas) ──
             # Collect all PAMTs that need processing
             pamt_paths = set()
-        
+
             for fp in file_deltas:
-            
                 if fp.endswith(".pamt"):
                     pamt_paths.add(fp)
-        
+
             for pamt_dir in self._pamt_entry_updates:
                 pamt_paths.add(f"{pamt_dir}/0.pamt")
+
+            # Also include any PAMT that has a vanilla backup (was previously
+            # modified by CDUMM). If its mod is now disabled, it won't be in
+            # file_deltas or _pamt_entry_updates — but the stale modded file
+            # on disk must be re-composed (to vanilla) and included in
+            # modified_pamts so PAPGT gets a consistent hash.
+            for vp in self._vanilla_dir.glob("????/0.pamt"):
+                pamt_paths.add(f"{vp.parent.name}/0.pamt")
 
         
             for pamt_path in sorted(pamt_paths):
@@ -747,7 +754,15 @@ class ApplyWorker(QObject):
                     logger.info("Cleaned up orphan directory during apply: %s", d.name)
 
             papgt_mgr = PapgtManager(self._game_dir, self._vanilla_dir)
-        
+
+            # DEBUG: log modified_pamts state before PAPGT rebuild
+            from cdumm.archive.hashlittle import compute_pamt_hash as _cph
+            for _d, _pb in modified_pamts.items():
+                _stored = struct.unpack_from("<I", _pb, 0)[0] if len(_pb) >= 4 else 0
+                _computed = _cph(_pb) if len(_pb) >= 12 else 0
+                logger.debug("pre-rebuild modified_pamts[%s]: stored=%08X computed=%08X equal=%s",
+                             _d, _stored, _computed, _stored == _computed)
+
             try:
                 papgt_bytes = papgt_mgr.rebuild(modified_pamts)
                 txn.stage_file("meta/0.papgt", papgt_bytes)
@@ -1065,16 +1080,23 @@ class ApplyWorker(QObject):
             else:
                 size_preserving.append(d)
 
-        # Step 1: Apply full-replace deltas (last one wins if multiple)
-    
+        # Step 1: Apply full-replace deltas (last one wins if multiple).
+        # Deduplicate by delta_path: multiple mod_deltas rows for the same file
+        # can share a delta (range-conflict metadata), but the delta must only
+        # be applied once or subsequent applications corrupt the output.
+        seen: dict[str, dict] = {}
         for d in full_replace:
+            seen[d["delta_path"]] = d
+        for d in seen.values():
             current = apply_delta_from_file(current, Path(d["delta_path"]))
             logger.info("Applied full-replace delta for %s from %s",
                         file_path, d.get("mod_name", "?"))
 
-        # Step 2: Apply SPRS deltas that shift file size
-    
+        # Step 2: Apply SPRS deltas that shift file size (deduplicated)
+        seen_sprs: dict[str, dict] = {}
         for d in sprs_shifted:
+            seen_sprs[d["delta_path"]] = d
+        for d in seen_sprs.values():
             current = apply_delta_from_file(current, Path(d["delta_path"]))
 
     
@@ -1642,12 +1664,14 @@ class ApplyWorker(QObject):
         for update in entry_updates:
             _apply_pamt_entry_update(buf, update)
 
-        # Apply byte-level PAMT deltas on top (from zip/JSON mods)
-    
+        # Apply byte-level PAMT deltas on top (from zip/JSON mods).
+        # Deduplicate by delta_path (same reason as _compose_file full_replace).
         if byte_deltas:
             current = bytes(buf)
-        
+            seen_pamt: dict[str, dict] = {}
             for d in byte_deltas:
+                seen_pamt[d["delta_path"]] = d
+            for d in seen_pamt.values():
                 current = apply_delta_from_file(current, Path(d["delta_path"]))
             buf = bytearray(current)
 
