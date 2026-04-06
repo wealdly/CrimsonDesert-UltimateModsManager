@@ -118,8 +118,7 @@ def _apply_sparse_patch_streaming_fd(f, vanilla_bytes: bytes) -> bytes:
     count = struct.unpack("<I", f.read(4))[0]
 
     for i in range(count):
-        file_offset = struct.unpack("<Q", f.read(8))[0]
-        length = struct.unpack("<I", f.read(4))[0]
+        file_offset, length = struct.unpack("<QI", f.read(12))
         data = f.read(length)
 
         end = file_offset + length

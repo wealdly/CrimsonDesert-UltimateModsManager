@@ -256,19 +256,29 @@ class ConflictDetector:
                 ))
                 continue
 
-            # Check for byte-range overlaps; report at most one conflict per file pair
-            # to avoid flooding the 200-conflict cap from a single heavily-overlapping pair.
+            # Check for byte-range overlaps using a sorted two-pointer scan: O((n+m)log(n+m))
+            # vs the previous O(n*m) nested loop.  Reports at most one conflict per file pair.
             has_overlap = False
             overlap_start = overlap_end = 0
-            for a_start, a_end in a_ranges:
-                for b_start, b_end in b_ranges:
-                    if a_start < b_end and b_start < a_end:
-                        has_overlap = True
-                        overlap_start = max(a_start, b_start)
-                        overlap_end = min(a_end, b_end)
-                        break
-                if has_overlap:
+            a_sorted = sorted(a_ranges)
+            b_sorted = sorted(b_ranges)
+            ai = bi = 0
+            while ai < len(a_sorted) and bi < len(b_sorted):
+                a_start, a_end = a_sorted[ai]
+                b_start, b_end = b_sorted[bi]
+                if a_start < b_end and b_start < a_end:
+                    has_overlap = True
+                    overlap_start = max(a_start, b_start)
+                    overlap_end = min(a_end, b_end)
                     break
+                if a_end <= b_start:
+                    ai += 1
+                elif b_end <= a_start:
+                    bi += 1
+                elif a_end < b_end:
+                    ai += 1
+                else:
+                    bi += 1
 
             if has_overlap:
                 conflicts.append(Conflict(

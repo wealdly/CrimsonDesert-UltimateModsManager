@@ -33,20 +33,14 @@ def hashlittle(data: bytes, initval: int = 0) -> int:
     # Handle remaining bytes
     remaining = data[offset:]
     if length > 0:
-        # Pad remaining bytes into a, b, c
+        # Pad to 12 bytes and unpack as three little-endian uint32s.
+        # Zero bytes in padded slots contribute nothing, so this is
+        # equivalent to the original byte-by-byte conditional accumulation.
         padded = remaining + b"\x00" * (12 - len(remaining))
-        if length >= 1: a = (a + padded[0]) & 0xFFFFFFFF
-        if length >= 2: a = (a + (padded[1] << 8)) & 0xFFFFFFFF
-        if length >= 3: a = (a + (padded[2] << 16)) & 0xFFFFFFFF
-        if length >= 4: a = (a + (padded[3] << 24)) & 0xFFFFFFFF
-        if length >= 5: b = (b + padded[4]) & 0xFFFFFFFF
-        if length >= 6: b = (b + (padded[5] << 8)) & 0xFFFFFFFF
-        if length >= 7: b = (b + (padded[6] << 16)) & 0xFFFFFFFF
-        if length >= 8: b = (b + (padded[7] << 24)) & 0xFFFFFFFF
-        if length >= 9: c = (c + padded[8]) & 0xFFFFFFFF
-        if length >= 10: c = (c + (padded[9] << 8)) & 0xFFFFFFFF
-        if length >= 11: c = (c + (padded[10] << 16)) & 0xFFFFFFFF
-        if length >= 12: c = (c + (padded[11] << 24)) & 0xFFFFFFFF
+        va, vb, vc = struct.unpack_from("<III", padded)
+        if length >= 1: a = (a + va) & 0xFFFFFFFF
+        if length >= 5: b = (b + vb) & 0xFFFFFFFF
+        if length >= 9: c = (c + vc) & 0xFFFFFFFF
 
         # Final mixing
         c ^= b; c = (c - ((b << 14) | (b >> 18))) & 0xFFFFFFFF

@@ -81,11 +81,8 @@ def _delta_changes_size(delta_path: Path, vanilla_size: int) -> bool:
                 count = struct.unpack("<I", f.read(4))[0]
             
                 for _ in range(count):
-                    offset = struct.unpack("<Q", f.read(8))[0]
-                    length = struct.unpack("<I", f.read(4))[0]
-                
+                    offset, length = struct.unpack("<QI", f.read(12))
                     if offset + length > vanilla_size:
-                    
                         return True
                     f.seek(length, 1)
     except Exception:
@@ -307,13 +304,9 @@ def _apply_pamt_entry_update(data: bytearray, update: dict) -> None:
         paz_index = entry.paz_index
     
         if paz_index < paz_count:
-            table_off = 16
-        
-            for i in range(paz_index):
-                table_off += 8
-            
-                if i < paz_count - 1:
-                    table_off += 4
+            # Each entry is 12 bytes (hash 4 + size 4 + separator 4), except last has no separator.
+            # All iterated entries have i < paz_count-1 when paz_index < paz_count, so all add 12.
+            table_off = 16 + paz_index * 12
             size_off = table_off + 4  # skip hash, point to size
             old_size = struct.unpack_from("<I", data, size_off)[0]
             # Use the larger of current and new size (multiple entries may append)
@@ -1013,9 +1006,24 @@ class ApplyWorker(QObject):
 
             current_buf = bytearray(game_path.read_bytes())
             range_entries = _load_range_backup(self._vanilla_dir, file_path)
-        
+
             if range_entries:
                 _apply_ranges_to_buf(current_buf, range_entries)
+                # Truncate stale tail from previous appends (previous applies
+                # appended entries past vanilla EOF; range backup doesn't cover
+                # that region, so reconstructed "vanilla" is larger than true
+                # vanilla — truncate to snapshot size to fix append offsets).
+                try:
+                    snap = self._db.connection.execute(
+                        "SELECT file_size FROM snapshots WHERE file_path = ?",
+                        (file_path,)).fetchone()
+                    if snap and len(current_buf) > snap[0]:
+                        logger.info(
+                            "Truncating stale tail in %s: %d -> %d bytes",
+                            file_path, len(current_buf), snap[0])
+                        del current_buf[snap[0]:]
+                except Exception:
+                    pass
             current = bytes(current_buf)
 
         vanilla_size = len(current)
@@ -1299,10 +1307,18 @@ class ApplyWorker(QObject):
 
                     # Three-way merge: only apply bytes that THIS mod changed
                 
-                    for i in range(min(len(vanilla_content), len(mod_content))):
-                    
-                        if mod_content[i] != vanilla_content[i]:
-                            merged[i] = mod_content[i]
+                    # Apply bytes that this mod changed vs vanilla, in 64 KB chunks
+                    # to avoid per-byte Python overhead on large files.
+                    _CHUNK = 65536
+                    _n = min(len(vanilla_content), len(mod_content))
+                    for _cs in range(0, _n, _CHUNK):
+                        _ce = min(_cs + _CHUNK, _n)
+                        _v = vanilla_content[_cs:_ce]
+                        _m = mod_content[_cs:_ce]
+                        if _v != _m:
+                            for _i in range(len(_v)):
+                                if _v[_i] != _m[_i]:
+                                    merged[_cs + _i] = _m[_i]
 
                     mod_names.append(d.get("mod_name", "?"))
                     deltas_to_exclude.add(d["delta_path"])
@@ -1672,26 +1688,28 @@ class ApplyWorker(QObject):
         if range_entries:
             buf = bytearray(game_path.read_bytes())
             _apply_ranges_to_buf(buf, range_entries)
-            result = bytes(buf)
-            # Verify reconstructed vanilla against snapshot
-        
+            # Verify reconstructed vanilla and truncate stale tail from
+            # previous appends (see _compose_file for the same fix).
             try:
                 snap = self._db.connection.execute(
-                    "SELECT file_hash FROM snapshots WHERE file_path = ?",
+                    "SELECT file_hash, file_size FROM snapshots WHERE file_path = ?",
                     (file_path,)).fetchone()
-            
                 if snap:
+                    snap_hash, snap_size = snap
+                    if len(buf) > snap_size:
+                        logger.info(
+                            "Truncating stale tail in %s: %d -> %d bytes",
+                            file_path, len(buf), snap_size)
+                        del buf[snap_size:]
                     import xxhash
-                    h = xxhash.xxh3_128(result).hexdigest()
-                
-                    if h != snap[0]:
+                    h = xxhash.xxh3_128(bytes(buf)).hexdigest()
+                    if h != snap_hash:
                         logger.warning(
                             "Range-reconstructed vanilla for %s doesn't match snapshot "
                             "(game file may have untracked modifications)", file_path)
             except Exception:
                 pass
-        
-            return result
+            return bytes(buf)
 
     
         return None
@@ -2063,7 +2081,14 @@ class RevertWorker(QObject):
         if range_entries:
             buf = bytearray(game_path.read_bytes())
             _apply_ranges_to_buf(buf, range_entries)
-        
+            try:
+                snap = self._db.connection.execute(
+                    "SELECT file_size FROM snapshots WHERE file_path = ?",
+                    (file_path,)).fetchone()
+                if snap and len(buf) > snap[0]:
+                    del buf[snap[0]:]
+            except Exception:
+                pass
             return bytes(buf)
 
     

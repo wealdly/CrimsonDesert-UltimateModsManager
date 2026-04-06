@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import xxhash
+
 from cdumm.archive.hashlittle import hashlittle, compute_pamt_hash, compute_papgt_hash
-from cdumm.engine.apply_engine import ApplyWorker, RevertWorker
+from cdumm.engine.apply_engine import ApplyWorker, RevertWorker, _save_range_backup
 from cdumm.engine.delta_engine import generate_delta, save_delta
 from cdumm.storage.database import Database
 
@@ -176,3 +178,54 @@ def test_revert_no_backups(tmp_path: Path) -> None:
     assert len(errors) == 1
     assert "No vanilla" in errors[0]
     db.close()
+
+
+def test_get_vanilla_bytes_truncates_stale_tail(tmp_path: Path) -> None:
+    """Range-reconstructed vanilla must be truncated to snapshot size.
+
+    Bug: PAZ files grow on every apply because entries are appended at the end
+    of the range-reconstructed 'vanilla', which includes a stale tail from
+    previous appended entries that the range backup cannot cover.  The fix
+    truncates the reconstructed buffer to the snapshot-recorded file size.
+    """
+    game_dir = tmp_path / "game"
+    vanilla_dir = tmp_path / "vanilla"
+    (game_dir / "0008").mkdir(parents=True)
+    vanilla_dir.mkdir()
+
+    # Vanilla: 100 bytes of 'V'
+    vanilla_bytes = b"V" * 100
+
+    # Write vanilla to game file initially so _save_range_backup reads it
+    paz_path = game_dir / "0008" / "0.paz"
+    paz_path.write_bytes(vanilla_bytes)
+
+    # Create range backup covering positions 0..9 (records vanilla 'V' * 10)
+    _save_range_backup(game_dir, vanilla_dir, "0008/0.paz", [(0, 10)])
+
+    # Now simulate a previous apply: bytes 0..9 are modified, stale tail added
+    stale_game = b"M" * 10 + b"V" * 90 + b"STALE" * 10  # 150 bytes
+    paz_path.write_bytes(stale_game)
+
+    # Snapshot records vanilla size (100) and hash
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    snap_hash = xxhash.xxh3_128(vanilla_bytes).hexdigest()
+    db.connection.execute(
+        "INSERT INTO snapshots (file_path, file_hash, file_size) VALUES (?, ?, ?)",
+        ("0008/0.paz", snap_hash, 100),
+    )
+    db.connection.commit()
+
+    worker = ApplyWorker(game_dir, vanilla_dir, db.db_path)
+    worker._db = db
+
+    result = worker._get_vanilla_bytes("0008/0.paz")
+
+    # Stale tail must be removed — result should be exactly 100 bytes
+    assert result is not None
+    assert len(result) == 100, f"Expected 100 bytes, got {len(result)}"
+    # Range backup restored positions 0..9 back to vanilla 'V'
+    assert result == vanilla_bytes, "Reconstructed vanilla doesn't match expected"
+    db.close()
+
