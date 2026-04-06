@@ -1,4 +1,51 @@
-# Crimson Desert Ultimate Mods Manager
+# Crimson Desert Ultimate Mods Manager — wealdly fork
+
+> **This is a personal fork of [faisalkindi/CrimsonDesert-UltimateModsManager](https://github.com/faisalkindi/CrimsonDesert-UltimateModsManager).**
+> Full credit and deep thanks to **[@faisalkindi](https://github.com/faisalkindi)** for creating and maintaining the original tool — it is excellent work.
+> This fork tracks upstream and adds the changes listed below. No upstream pull requests are planned; changes here may be experimental or opinionated.
+
+---
+
+## Changes in this fork
+
+### Bug fixes
+- **Stuck addon removal** — mods importing over existing enabled addons no longer get permanently stuck; the replacement flow correctly disables and re-imports without leaving zombie deltas.
+- **Priority after update** — re-importing a mod over itself now restores its original load-order position instead of appending it to the bottom.
+- **PAMT CRC on import** — missing or wrong CRC in imported PAMTs is auto-corrected at import time, preventing grey-screen crashes.
+- **Multi-queue import** — batch-dropping several mods at once no longer causes the second and later imports to silently fail.
+- **Entry-level fallback** — when entry-level PAZ decomposition produces zero changed entries, the engine correctly falls back to byte-level delta instead of recording an empty mod.
+- **Configurable source path** — configurable (labeled-JSON) mods now store a correct `source_path` so re-configuration works after a session restart.
+
+### Per-mod undo / direct revert
+Each imported mod writes a companion `.undo` file (same sparse SPRS format as `.vranges` backups) storing the vanilla bytes at exactly the positions the mod touches. When you remove a mod, the engine attempts a direct in-place revert without requiring a full Apply cycle. Falls back gracefully to Apply when byte-range conflicts with other enabled mods are detected.
+
+### Loose file mod support
+Files under loose game directories (`ui/`, `soundassets/`, `video/`, `fonts/`, `data/`, etc.) are now recognised and handled. "JustLoad"-style zips that ship only loose assets (e.g. `ui/*.mp4` cutscene replacements) import cleanly.
+
+### Loose-file variant picker
+Archives or directories containing multiple loose-file mod variants now show a picker dialog — the same treatment PAZ multi-variant zips already got — so you choose exactly which preset to install.
+
+### Auto-detect game directory
+On first launch (or after Steam moves your library), the manager auto-detects the game directory via a Steam library scan instead of always falling back to the manual setup dialog. Saved paths are now validated with `validate_game_directory()` instead of a bare `.exists()` check.
+
+### ENTR-aware conflict detection
+The conflict detector now compares mods at the PAMT entry level when both mods carry entry-path metadata. Two mods that modify different entries in the same PAZ are correctly reported as "compatible PAZ-level overlap" rather than a hard byte-range conflict.
+
+### Upstream v2.1.2 + v2.1.3 merged
+- LZ4 null-padding crash fix (`paz_repack.py`) — XML/CSS files shorter than their vanilla slot are no longer padded with nulls before compression.
+- PAMT byte-range delta cleanup — spurious PAMT byte-range deltas created during PAZ entry decomposition are removed after import.
+
+### Auto-update suppressed
+The upstream auto-update check is disabled (`_UPDATE_DISABLED = True`) and the version is pinned to `999.0.0` so the fork exe never prompts to overwrite itself with an upstream release.
+
+### Performance improvements
+- `SnapshotManager` builds an in-memory path/hash cache on first use — eliminates one SQLite round-trip per file during the hot import path.
+- `apply_delta_from_file` now uses a single `open()` call instead of opening the file twice.
+- `_try_paz_entry_import` keeps both PAZ files open across the full entry-comparison loop instead of reopening on every iteration (was 200+ `open/close` cycles on 900 MB files).
+- `_find_overlapping_delta_groups` issues one batched `IN (…)` query instead of one query per delta.
+- Dead-code block (~35 unreachable lines) removed from `snapshot_manager.py`.
+
+---
 
 A desktop mod manager for **Crimson Desert** that handles the game's PAZ/PAMT/PAPGT archive format. Install, manage, and safely combine multiple mods with automatic conflict detection, JSON patch merging, and one-click revert to vanilla.
 
@@ -127,13 +174,13 @@ Built-in diagnostic report generator that collects system info, installed mods, 
 ## Installation
 
 ### Option 1: Standalone Executable (Recommended)
-Download `CDUMM.exe` from the [Releases](https://github.com/faisalkindi/CrimsonDesert-UltimateModsManager/releases) page. No Python required. Just run it.
+Download `CDUMM.exe` from the [Releases](https://github.com/wealdly/CrimsonDesert-UltimateModsManager/releases) page of this fork, or from the [upstream releases](https://github.com/faisalkindi/CrimsonDesert-UltimateModsManager/releases). No Python required. Just run it.
 
-### Option 2: Run from Source
+### Option 2: Run from Source (this fork)
 Requires Python 3.10+.
 
 ```bash
-git clone https://github.com/faisalkindi/CrimsonDesert-UltimateModsManager.git
+git clone https://github.com/wealdly/CrimsonDesert-UltimateModsManager.git
 cd CrimsonDesert-UltimateModsManager
 pip install -e .
 py -3 -m cdumm.main

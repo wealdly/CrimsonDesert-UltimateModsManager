@@ -89,15 +89,12 @@ def apply_delta_from_file(vanilla_bytes: bytes, delta_path: Path) -> bytes:
     with open(delta_path, "rb") as f:
         magic = f.read(4)
 
-    if magic == FULL_COPY_MAGIC:
-        # Full copy — just return the file contents after the magic
-        with open(delta_path, "rb") as f:
-            f.seek(4)
+        if magic == FULL_COPY_MAGIC:
             return f.read()
 
-    if magic == SPARSE_MAGIC and file_size > 500 * 1024 * 1024:
-        # Stream sparse patches from disk for large deltas
-        return _apply_sparse_patch_streaming(vanilla_bytes, delta_path)
+        if magic == SPARSE_MAGIC and file_size > 500 * 1024 * 1024:
+            # Stream sparse patches from disk for large deltas (file already open)
+            return _apply_sparse_patch_streaming_fd(f, vanilla_bytes)
 
     # Small enough to load into memory
     delta_bytes = delta_path.read_bytes()
@@ -106,21 +103,28 @@ def apply_delta_from_file(vanilla_bytes: bytes, delta_path: Path) -> bytes:
 
 def _apply_sparse_patch_streaming(vanilla_bytes: bytes, delta_path: Path) -> bytes:
     """Apply a sparse patch by streaming entries from disk (low memory)."""
-    result = bytearray(vanilla_bytes)
-
     with open(delta_path, "rb") as f:
         f.seek(4)  # skip magic
-        count = struct.unpack("<I", f.read(4))[0]
+        return _apply_sparse_patch_streaming_fd(f, vanilla_bytes)
 
-        for i in range(count):
-            file_offset = struct.unpack("<Q", f.read(8))[0]
-            length = struct.unpack("<I", f.read(4))[0]
-            data = f.read(length)
 
-            end = file_offset + length
-            if end > len(result):
-                result.extend(b"\x00" * (end - len(result)))
-            result[file_offset:end] = data
+def _apply_sparse_patch_streaming_fd(f, vanilla_bytes: bytes) -> bytes:
+    """Apply a sparse patch from an already-open file descriptor at current position.
+
+    Expects the read cursor to be positioned just after the 4-byte magic.
+    """
+    result = bytearray(vanilla_bytes)
+    count = struct.unpack("<I", f.read(4))[0]
+
+    for i in range(count):
+        file_offset = struct.unpack("<Q", f.read(8))[0]
+        length = struct.unpack("<I", f.read(4))[0]
+        data = f.read(length)
+
+        end = file_offset + length
+        if end > len(result):
+            result.extend(b"\x00" * (end - len(result)))
+        result[file_offset:end] = data
 
     return bytes(result)
 

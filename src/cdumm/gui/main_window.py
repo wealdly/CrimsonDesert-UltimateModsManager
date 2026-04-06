@@ -39,11 +39,14 @@ logger = logging.getLogger(__name__)
 
 
 def _is_standalone_paz_mod(path: Path) -> bool:
-    """Check if path is a standalone PAZ mod (0.paz + 0.pamt, not in a numbered dir).
+    """Check if path is a standalone PAZ mod (0.paz + 0.pamt, not in a numbered dir),
+    or a loose-asset-only mod (no PAZ/PAMT, only files under known loose dirs like ui/).
 
-    These mods add a new PAZ directory and don't need a vanilla snapshot.
+    These mods add new files and don't need a vanilla snapshot.
     """
     import zipfile
+    from cdumm.engine.import_handler import _LOOSE_ASSET_DIRS
+
     if path.is_dir():
         # Check folder: has 0.paz + 0.pamt at root or one level deep
         if (path / "0.paz").exists() and (path / "0.pamt").exists():
@@ -53,14 +56,35 @@ def _is_standalone_paz_mod(path: Path) -> bool:
                 # But NOT if it's a numbered directory (those are regular mods)
                 if not (sub.name.isdigit() and len(sub.name) == 4):
                     return True
+        # Check loose-asset-only folder: all files under known loose dirs, no PAZ/PAMT
+        all_files = list(path.rglob("*"))
+        file_list = [f for f in all_files if f.is_file()]
+        if file_list:
+            if all(
+                f.relative_to(path).parts[0].lower() in _LOOSE_ASSET_DIRS
+                for f in file_list
+            ):
+                return True
         return False
-    if path.suffix.lower() == ".zip":
+    if path.suffix.lower() in (".zip", ".7z"):
         try:
-            with zipfile.ZipFile(path) as zf:
-                names = zf.namelist()
-                has_paz = any(n.endswith("/0.paz") or n == "0.paz" for n in names)
-                has_pamt = any(n.endswith("/0.pamt") or n == "0.pamt" for n in names)
-                return has_paz and has_pamt
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path) as zf:
+                    names = [n for n in zf.namelist() if not n.endswith("/")]
+            else:
+                import py7zr
+                with py7zr.SevenZipFile(path, 'r') as zf:
+                    names = [n for n in zf.getnames() if not n.endswith("/")]
+            if not names:
+                return False
+            has_paz = any(n.endswith("/0.paz") or n == "0.paz" for n in names)
+            has_pamt = any(n.endswith("/0.pamt") or n == "0.pamt" for n in names)
+            if has_paz and has_pamt:
+                return True
+            # Loose-asset-only: every file's top-level dir is a known loose dir
+            if all(n.split("/")[0].lower() in _LOOSE_ASSET_DIRS for n in names):
+                return True
+            return False
         except Exception:
             return False
     return False
@@ -1186,7 +1210,6 @@ class MainWindow(QMainWindow):
         if purged_count and purged_count > 0:
             self.statusBar().showMessage(
                 f"Purged {purged_count} corrupted vanilla backup(s)", 10000)
-        config.set("backups_verified", "1")
 
     def _auto_snapshot_first_run(self) -> None:
         reply = QMessageBox.question(
@@ -1875,6 +1898,25 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage("Import cancelled.", 5000)
                     return
 
+            # Check for loose-file mod variants (files/NNNN/ structure)
+            from cdumm.engine.import_handler import find_loose_file_variants
+            lfm_dir_variants = find_loose_file_variants(path)
+            if len(lfm_dir_variants) > 1:
+                from PySide6.QtWidgets import QInputDialog
+                lfm_names = [v.get("id", str(i)) for i, v in enumerate(lfm_dir_variants)]
+                chosen_lfm, ok_lfm = QInputDialog.getItem(
+                    self, "Choose Loose-File Variant",
+                    f"This mod has {len(lfm_dir_variants)} loose-file variants.\n"
+                    "Choose which one to install:",
+                    lfm_names, 0, False)
+                if not ok_lfm:
+                    self.statusBar().showMessage("Import cancelled.", 5000)
+                    return
+                # Repoint path to the selected variant's base directory
+                selected_lfm = lfm_dir_variants[lfm_names.index(chosen_lfm)]
+                path = selected_lfm["_base_dir"]
+                logger.info("User selected loose-file variant: %s", path.name)
+
         # Check for multiple JSON presets — let user pick one
         # For zips, extract to temp first to scan for presets
         from cdumm.gui.preset_picker import find_json_presets, PresetPickerDialog
@@ -1932,6 +1974,29 @@ class MainWindow(QMainWindow):
 
         json_data = detect_json_patch(json_check_path)
 
+        # Check for loose-file mod variants inside zip/7z
+        _lfm_selected = False
+        if _label_tmp:
+            from cdumm.engine.import_handler import find_loose_file_variants
+            lfm_zip_variants = find_loose_file_variants(Path(_label_tmp))
+            if len(lfm_zip_variants) > 1:
+                from PySide6.QtWidgets import QInputDialog
+                lfm_zip_names = [v.get("id", str(i)) for i, v in enumerate(lfm_zip_variants)]
+                chosen_z, ok_z = QInputDialog.getItem(
+                    self, "Choose Loose-File Variant",
+                    f"This archive has {len(lfm_zip_variants)} loose-file variants.\n"
+                    "Choose which one to install:",
+                    lfm_zip_names, 0, False)
+                if not ok_z:
+                    import shutil
+                    shutil.rmtree(_label_tmp, ignore_errors=True)
+                    self.statusBar().showMessage("Import cancelled.", 5000)
+                    return
+                selected_z = lfm_zip_variants[lfm_zip_names.index(chosen_z)]
+                path = selected_z["_base_dir"]
+                _lfm_selected = True
+                logger.info("User selected loose-file zip variant: %s", path.name)
+
         # Mark for configurable flag only if the mod has real configurable options
         if json_data and has_labeled_changes(json_data):
             self._configurable_source = str(path)
@@ -1981,9 +2046,12 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Import cancelled.", 5000)
                 return
 
-        if _label_tmp:
+        if _label_tmp and not _lfm_selected:
             import shutil
             shutil.rmtree(_label_tmp, ignore_errors=True)
+        elif _label_tmp and _lfm_selected:
+            # Keep the temp dir alive until import finishes — worker needs the files
+            self._pending_tmp_cleanup = _label_tmp
 
         # Regular PAZ mod — run on background thread
         logger.info("Starting import worker for: %s", path)
@@ -2262,6 +2330,12 @@ class MainWindow(QMainWindow):
         logger.info("Import callback received, syncing DB...")
         self._sync_db()
 
+        # Clean up deferred temp dir from loose-file zip variant import
+        if hasattr(self, '_pending_tmp_cleanup') and self._pending_tmp_cleanup:
+            import shutil
+            shutil.rmtree(self._pending_tmp_cleanup, ignore_errors=True)
+            self._pending_tmp_cleanup = None
+
         if hasattr(result, 'error') and result.error:
             # Collect error — don't block if more imports are queued
             if not hasattr(self, '_import_errors'):
@@ -2533,7 +2607,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Uninstalled {count} mod(s) successfully!", 10000)
         else:
             self._refresh_all()
-            self.statusBar().showMessage("Mods applied. Verifying...", 5000)
         self._snapshot_applied_state()
         self.statusBar().showMessage("Mods applied successfully!", 10000)
         self._log_activity("apply", "Mods applied successfully")
@@ -2834,16 +2907,48 @@ class MainWindow(QMainWindow):
                     break
 
             if needs_apply:
-                # Disable mods first so the apply engine reverts their files,
-                # then remove them from the database after apply completes.
+                from cdumm.engine.apply_engine import revert_mod_direct
+                fallback: list[tuple[int, str]] = []
                 for mid, name in mods_to_remove:
-                    self._mod_manager.set_enabled(mid, False)
-                    logger.info("Disabled for uninstall: %s", name)
-                self._pending_removals = [mid for mid, _ in mods_to_remove]
-                self._refresh_all()
-                self.statusBar().showMessage(
-                    f"Uninstalling {len(mods_to_remove)} mod(s) — Apply needed to revert files...", 10000)
-                self._on_apply()
+                    mod_row = self._db.connection.execute(
+                        "SELECT enabled FROM mods WHERE id = ?", (mid,)).fetchone()
+                    delta_count = self._db.connection.execute(
+                        "SELECT COUNT(*) FROM mod_deltas WHERE mod_id = ?", (mid,)).fetchone()[0]
+                    if not (mod_row and mod_row[0] and delta_count > 0):
+                        # Not actually live — remove directly
+                        self._mod_manager.remove_mod(mid)
+                        self._log_activity("remove", f"Removed: {name}",
+                                           "Mod was not applied, no files to revert")
+                        logger.info("Removed unapplied mod: %s", name)
+                        continue
+                    ok, msg = revert_mod_direct(
+                        mid, self._game_dir, self._deltas_dir, self._db.db_path)
+                    if ok:
+                        self._mod_manager.remove_mod(mid)
+                        self._log_activity("remove", f"Removed: {name}",
+                                           "Reverted via undo files")
+                        logger.info("Direct-reverted and removed: %s", name)
+                    else:
+                        if msg not in ("no_undo_files", "byte_range_conflict"):
+                            logger.warning(
+                                "revert_mod_direct partial failure for %s: %s", name, msg)
+                        fallback.append((mid, name))
+
+                if fallback:
+                    # Fall back to disable → Apply for mods without undo files
+                    for mid, name in fallback:
+                        self._mod_manager.set_enabled(mid, False)
+                        logger.info("Disabled for uninstall (fallback): %s", name)
+                    self._pending_removals = [mid for mid, _ in fallback]
+                    self._refresh_all()
+                    self.statusBar().showMessage(
+                        f"Uninstalling {len(fallback)} mod(s) — Apply needed to revert files...",
+                        10000)
+                    self._on_apply()
+                else:
+                    self._refresh_all()
+                    self.statusBar().showMessage(
+                        f"Removed {len(mods_to_remove)} mod(s).", 10000)
             else:
                 # Mod was never applied — just remove from database
                 for mid, name in mods_to_remove:
@@ -3100,11 +3205,9 @@ class MainWindow(QMainWindow):
         if json_data:
             import json as _json
             # Save old state
+            old_mod_id = mod["id"]
             old_priority = mod.get("priority", 0)
             old_enabled = mod.get("enabled", False)
-
-            # Remove old mod and re-import with new selection
-            self._mod_manager.remove_mod(mod["id"])
 
             tmp_json = Path(tempfile.mktemp(suffix=".json", prefix="cdumm_reconfig_"))
             write_data = json_data.copy()
@@ -3127,6 +3230,14 @@ class MainWindow(QMainWindow):
             new_name = json_data.get("name", mod["name"])
 
             def on_done(result):
+                # Only remove the old mod AFTER the re-import succeeds, so
+                # that if the import fails/crashes the old delta data is
+                # preserved and game files can still be reverted.
+                try:
+                    self._mod_manager.remove_mod(old_mod_id)
+                    logger.info("Reconfigure: removed old mod id=%d after successful re-import", old_mod_id)
+                except Exception as e:
+                    logger.warning("Reconfigure: failed to remove old mod id=%d: %s", old_mod_id, e)
                 self._on_import_finished(result)
                 # Restore priority, update name to reflect new config
                 try:
@@ -3396,6 +3507,11 @@ class MainWindow(QMainWindow):
         self._snapshot_in_progress = False
         logger.info("Snapshot callback: %d files", count)
         self._sync_db()
+
+        # Invalidate SnapshotManager's in-memory path/hash caches so the
+        # next import reads the freshly-written snapshot rows.
+        if self._snapshot:
+            self._snapshot.invalidate_cache()
 
         # Save game version fingerprint with the snapshot
         try:

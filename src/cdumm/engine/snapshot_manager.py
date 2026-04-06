@@ -266,81 +266,45 @@ class SnapshotWorker(QObject):
 
         return problems
 
-        total = len(files_to_hash)
-        if total == 0:
-            self.error_occurred.emit(
-                "No PAZ/PAMT/PAPGT files found in game directory.\n\n"
-                f"Searched: {self._game_dir}\n"
-                "Expected directories: 0000-0032 with .paz and .pamt files."
-            )
-            return
-
-        # Calculate total bytes for accurate progress
-        total_bytes = sum(f.stat().st_size for f, _ in files_to_hash)
-        total_gb = total_bytes / (1024 ** 3)
-        logger.info("Snapshot: %d files, %.1f GB to hash", total, total_gb)
-        self.progress_updated.emit(0, f"Found {total} files ({total_gb:.1f} GB). Hashing...")
-
-        # Clear existing snapshot
-        self._thread_db.connection.execute("DELETE FROM snapshots")
-
-        bytes_hashed = 0
-        last_pct = -1  # throttle: only emit when percentage changes
-
-        # Hash each file and store
-        for i, (abs_path, rel_path) in enumerate(files_to_hash):
-            file_size_bytes = abs_path.stat().st_size
-            file_size_mb = file_size_bytes / (1024 * 1024)
-            logger.debug("Hashing [%d/%d]: %s (%.0f MB)", i + 1, total, rel_path, file_size_mb)
-
-            # Progress callback — throttled to only emit when overall % changes
-            def on_chunk(chunk_bytes_read, chunk_total, _rel=rel_path, _i=i,
-                         _base=bytes_hashed, _fmb=file_size_mb):
-                nonlocal last_pct
-                overall = _base + chunk_bytes_read
-                pct = int(overall / total_bytes * 100) if total_bytes > 0 else 0
-                if pct != last_pct:
-                    last_pct = pct
-                    chunk_pct = int(chunk_bytes_read / chunk_total * 100) if chunk_total > 0 else 100
-                    self.progress_updated.emit(
-                        pct,
-                        f"[{_i + 1}/{total}] {_rel} ({_fmb:.0f} MB) — {chunk_pct}%"
-                    )
-
-            file_hash, file_size = hash_file(abs_path, progress_callback=on_chunk)
-            bytes_hashed += file_size
-
-            self._thread_db.connection.execute(
-                "INSERT OR REPLACE INTO snapshots (file_path, file_hash, file_size) "
-                "VALUES (?, ?, ?)",
-                (rel_path, file_hash, file_size),
-            )
-
-            pct = int(bytes_hashed / total_bytes * 100) if total_bytes > 0 else 0
-            self.progress_updated.emit(pct, f"[{i + 1}/{total}] {rel_path} — done")
-            logger.debug("Hashed: %s -> %s", rel_path, file_hash[:16])
-
-        self._thread_db.connection.commit()
-        logger.info("Snapshot complete: %d files hashed", total)
-        self.finished.emit(total)
-
 
 class SnapshotManager:
     """High-level snapshot operations."""
 
     def __init__(self, db: Database) -> None:
         self._db = db
+        # Lazy in-memory cache of all snapshot paths (for O(1) membership tests).
+        # Populated on first use via _ensure_path_cache(); invalidated when the
+        # snapshot is rebuilt (SnapshotWorker calls invalidate_cache()).
+        self._path_cache: set[str] | None = None
+        self._hash_cache: dict[str, str] | None = None
+
+    def invalidate_cache(self) -> None:
+        """Drop in-memory caches after snapshot rebuild."""
+        self._path_cache = None
+        self._hash_cache = None
+
+    def _ensure_path_cache(self) -> None:
+        """Load all snapshot paths and hashes into memory (once per snapshot)."""
+        if self._path_cache is not None:
+            return
+        cursor = self._db.connection.execute(
+            "SELECT file_path, file_hash FROM snapshots")
+        rows = cursor.fetchall()
+        self._path_cache = {r[0] for r in rows}
+        self._hash_cache = {r[0]: r[1] for r in rows}
 
     def has_snapshot(self) -> bool:
         cursor = self._db.connection.execute("SELECT COUNT(*) FROM snapshots")
         return cursor.fetchone()[0] > 0
 
     def get_file_hash(self, rel_path: str) -> str | None:
-        cursor = self._db.connection.execute(
-            "SELECT file_hash FROM snapshots WHERE file_path = ?", (rel_path,)
-        )
-        row = cursor.fetchone()
-        return row[0] if row else None
+        self._ensure_path_cache()
+        return self._hash_cache.get(rel_path)
+
+    def file_in_snapshot(self, rel_path: str) -> bool:
+        """O(1) membership test — cheaper than get_file_hash when hash isn't needed."""
+        self._ensure_path_cache()
+        return rel_path in self._path_cache
 
     def get_snapshot_count(self) -> int:
         cursor = self._db.connection.execute("SELECT COUNT(*) FROM snapshots")

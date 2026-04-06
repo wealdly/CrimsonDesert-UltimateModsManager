@@ -82,6 +82,7 @@ def main() -> int:
 
     from cdumm.storage.database import Database
     from cdumm.storage.config import Config
+    from cdumm.storage.game_finder import find_game_directories, validate_game_directory
 
     # Find game directory first — DB lives in CDMods/ inside game dir
     from cdumm.storage.config import Config as _TmpConfig
@@ -100,7 +101,7 @@ def main() -> int:
     if _game_dir_file.exists():
         try:
             saved = _game_dir_file.read_text(encoding="utf-8").strip()
-            if saved and Path(saved).exists():
+            if saved and validate_game_directory(Path(saved)):
                 game_dir = saved
                 logger.info("Game directory from pointer: %s", game_dir)
         except Exception:
@@ -113,12 +114,27 @@ def main() -> int:
                 try:
                     tmp_db = Database(old_db)
                     tmp_db.initialize()
-                    game_dir = _TmpConfig(tmp_db).get("game_directory")
+                    candidate = _TmpConfig(tmp_db).get("game_directory")
                     tmp_db.close()
+                    if candidate and validate_game_directory(Path(candidate)):
+                        game_dir = candidate
                 except Exception:
                     pass
                 if game_dir:
                     break
+
+    # Method 3: Auto-detect via Steam library scan (handles game moves)
+    if game_dir is None:
+        try:
+            detected = find_game_directories()
+            if len(detected) == 1:
+                game_dir = str(detected[0])
+                logger.info("Auto-detected game directory: %s", game_dir)
+                # Persist so we don't need to scan next time
+                APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                _game_dir_file.write_text(game_dir, encoding="utf-8")
+        except Exception as e:
+            logger.debug("Auto-detect failed: %s", e)
 
     if game_dir is None:
         # First-run: game directory setup

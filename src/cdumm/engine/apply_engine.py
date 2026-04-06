@@ -13,6 +13,8 @@ sparse deltas. Only the specific byte ranges that mods modify are backed up.
 Bsdiff deltas use full file backups (but those files are always small).
 """
 import logging
+import re
+import sqlite3
 import struct
 from pathlib import Path
 
@@ -28,6 +30,9 @@ from cdumm.storage.database import Database
 logger = logging.getLogger(__name__)
 
 RANGE_BACKUP_EXT = ".vranges"  # sparse range backup extension
+
+# Same pattern as import_handler — only PAZ-system files tracked in snapshot
+_GAME_FILE_RE = re.compile(r'^(\d{4}/\d+\.(?:paz|pamt)|meta/\d+\.(?:papgt|pathc))$')
 
 
 def _backup_copy(src: Path, dst: Path) -> None:
@@ -142,15 +147,14 @@ def _save_range_backup(game_dir: Path, vanilla_dir: Path,
         # Load existing backup, find ranges not yet covered
         existing = _load_range_backup(vanilla_dir, file_path)
         if existing:
-            covered: set[tuple[int, int]] = set()
-            for offset, data in existing:
-                covered.add((offset, offset + len(data)))
-            # Find new ranges not covered by existing backup
+            # Build sorted list of covered intervals for efficient overlap check
+            covered_sorted: list[tuple[int, int]] = sorted(
+                (offset, offset + len(data)) for offset, data in existing)
+            # Find new ranges not fully covered by any existing interval
             new_ranges: list[tuple[int, int]] = []
             for start, end in merged:
-                # Check if this range is already fully covered
                 is_covered = any(
-                    cs <= start and ce >= end for cs, ce in covered)
+                    cs <= start and ce >= end for cs, ce in covered_sorted)
                 if not is_covered:
                     new_ranges.append((start, end))
             if not new_ranges:
@@ -639,7 +643,6 @@ class ApplyWorker(QObject):
             self.finished.emit()
 
         except Exception:
-            txn.cleanup_staging()
             raise
         finally:
             txn.cleanup_staging()
@@ -694,16 +697,21 @@ class ApplyWorker(QObject):
             # PAMT files always get full backups — they're small (<14MB)
             # and range backups are unreliable when the PAMT structure changes.
             # ENTR deltas also need full backups (entry-level composition).
-            has_bsdiff = self._has_bsdiff_delta(file_path)
-            needs_full = has_bsdiff or file_path.endswith(".pamt")
+            # Loose asset files (not in snapshot, e.g. ui/*.mp4) also get full
+            # backups since byte-range tracking is not meaningful for them.
+            has_bsdiff = self._has_bsdiff_delta(file_path, delta_infos or None)
+            is_loose = file_path not in snap_hashes and not _GAME_FILE_RE.match(file_path)
+            needs_full = has_bsdiff or file_path.endswith(".pamt") or is_loose
 
             if needs_full:
                 full_path = self._vanilla_dir / file_path.replace("/", "\\")
                 if not full_path.exists():
                     game_path = self._game_dir / file_path.replace("/", "\\")
                     if game_path.exists():
-                        # Validate: game file must match snapshot before backing up
-                        if not self._verify_is_vanilla(game_path, file_path, snap_hashes):
+                        # For loose files not in the snapshot, skip hash validation
+                        # and back them up unconditionally (no vanilla reference).
+                        if not is_loose and not self._verify_is_vanilla(
+                                game_path, file_path, snap_hashes):
                             logger.warning(
                                 "Skipping backup of %s — file doesn't match snapshot "
                                 "(may be modded). Revert will use range backup or "
@@ -746,8 +754,30 @@ class ApplyWorker(QObject):
 
         return True  # large file, size matches
 
-    def _has_bsdiff_delta(self, file_path: str) -> bool:
-        """Check if any mod delta for this file is bsdiff format."""
+    def _has_bsdiff_delta(self, file_path: str,
+                           delta_infos: list[dict] | None = None) -> bool:
+        """Check if any mod delta for this file is non-sparse (bsdiff/FULL_COPY).
+
+        delta_infos: pre-loaded delta list from _get_file_deltas() — if supplied,
+        uses it directly to avoid a redundant DB round-trip.  Falls back to a DB
+        query + file read only for revert-only files (where delta_infos is None).
+        """
+        # Fast path: use already-loaded delta metadata
+        if delta_infos:
+            for d in delta_infos:
+                dp = d.get("delta_path")
+                if not dp:
+                    continue
+                try:
+                    with open(dp, "rb") as f:
+                        magic = f.read(4)
+                    if magic not in (SPARSE_MAGIC, b"ENTR"):
+                        return True
+                except OSError:
+                    continue
+            return False
+
+        # Fallback: DB query for revert-only files (no pre-loaded delta_infos)
         cursor = self._db.connection.execute(
             "SELECT md.delta_path FROM mod_deltas md "
             "JOIN mods m ON md.mod_id = m.id "
@@ -758,7 +788,7 @@ class ApplyWorker(QObject):
             try:
                 with open(delta_path, "rb") as f:
                     magic = f.read(4)
-                if magic != SPARSE_MAGIC:
+                if magic not in (SPARSE_MAGIC, b"ENTR"):
                     return True
             except OSError:
                 continue
@@ -1101,34 +1131,50 @@ class ApplyWorker(QObject):
             for d, _ in patches:
                 already_files.add(d["delta_path"])
 
-        # Group byte-range deltas by approximate region (same file, overlapping ranges).
-        # Skip FULL_COPY deltas — they replace the entire file and are handled
-        # correctly by _compose_file's standard full_replace logic.
-        from collections import defaultdict
-        range_deltas = []
+        # Collect candidate delta paths for a single batched DB query.
+        candidate_paths = []
+        candidate_deltas = []
         for d in deltas:
             if d["delta_path"] in already_files:
                 continue
             if d.get("entry_path") or d.get("is_new") or d.get("json_patches"):
                 continue
-            # Skip FULL_COPY deltas (byte_start=0 and huge range = full file)
+            candidate_paths.append(d["delta_path"])
+            candidate_deltas.append(d)
+
+        if len(candidate_paths) < 2:
+            return {}
+
+        # Batch-fetch byte ranges for all candidates in one query.
+        placeholders = ",".join("?" * len(candidate_paths))
+        try:
+            rows = self._db.connection.execute(
+                f"SELECT delta_path, byte_start, byte_end FROM mod_deltas "
+                f"WHERE delta_path IN ({placeholders}) AND byte_start IS NOT NULL",
+                candidate_paths,
+            ).fetchall()
+        except Exception:
+            return {}
+        range_by_path = {r[0]: (r[1], r[2]) for r in rows}
+
+        # Group byte-range deltas by approximate region (same file, overlapping ranges).
+        # Skip FULL_COPY deltas — they replace the entire file and are handled
+        # correctly by _compose_file's standard full_replace logic.
+        range_deltas = []
+        for d in candidate_deltas:
+            dp = d["delta_path"]
+            if dp not in range_by_path:
+                continue
+            # Skip FULL_COPY deltas (magic check)
             try:
-                dp = Path(d["delta_path"])
                 with open(dp, "rb") as f:
                     magic = f.read(4)
                 if magic == b"FULL":
                     continue
             except Exception:
                 continue
-            # Read byte range from DB
-            try:
-                row = self._db.connection.execute(
-                    "SELECT byte_start, byte_end FROM mod_deltas WHERE delta_path = ? LIMIT 1",
-                    (d["delta_path"],)).fetchone()
-                if row and row[0] is not None:
-                    range_deltas.append((row[0], row[1], d))
-            except Exception:
-                continue
+            bs, be = range_by_path[dp]
+            range_deltas.append((bs, be, d))
 
         if len(range_deltas) < 2:
             return {}
@@ -1425,7 +1471,6 @@ class ApplyWorker(QObject):
             if vanilla_bytes:
                 snap_hash, snap_size = snap_map[rel]
                 # Only restore if file actually differs from vanilla
-                import hashlib
                 if len(vanilla_bytes) == snap_size:
                     game_bytes = game_file.read_bytes()
                     if game_bytes != vanilla_bytes:
@@ -1664,3 +1709,149 @@ class RevertWorker(QObject):
             return bytes(buf)
 
         return None
+
+
+# ── Direct single-mod revert ──────────────────────────────────────────────────
+
+UNDO_SUFFIX = ".undo"
+
+
+def revert_mod_direct(
+    mod_id: int, game_dir: Path, deltas_dir: Path, db_path: Path
+) -> tuple[bool, str]:
+    """Revert a single mod's changes directly from its per-mod undo files.
+
+    This does NOT require a full Apply cycle.  It reads the `.undo` files
+    written at import time — which store the exact vanilla bytes at each
+    changed position — and patches them back into the live game files.
+
+    PAPGT is also patched via the global vanilla backup if it exists.
+
+    Returns (success: bool, message: str).
+    Raises on unexpected I/O errors; returns (False, reason) for soft failures.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT file_path, delta_path, is_new "
+            "FROM mod_deltas WHERE mod_id = ?",
+            (mod_id,),
+        ).fetchall()
+
+        # If this mod has byte-range level conflicts with another currently-enabled
+        # mod, direct revert would clobber the other mod's bytes with vanilla.
+        # Fall back to Apply so the engine can re-apply the remaining mods properly.
+        conflict_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM conflicts c
+            JOIN mods m ON (
+                CASE WHEN c.mod_a_id = ? THEN c.mod_b_id ELSE c.mod_a_id END = m.id
+            )
+            WHERE (c.mod_a_id = ? OR c.mod_b_id = ?)
+              AND c.level = 'byte_range'
+              AND m.enabled = 1
+            """,
+            (mod_id, mod_id, mod_id),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    if conflict_count > 0:
+        return False, "byte_range_conflict"
+
+    if not rows:
+        return True, "No delta data — nothing to revert"
+
+    # Collect files that need undoing; track new files for deletion
+    files_to_undo: dict[str, list[Path]] = {}   # rel_path -> list of undo paths
+    new_files: set[str] = set()
+
+    for file_path, delta_path_str, is_new in rows:
+        if is_new:
+            new_files.add(file_path)
+            continue
+        delta_path = Path(delta_path_str)
+        undo_path = delta_path.with_suffix(delta_path.suffix + UNDO_SUFFIX)
+        if undo_path.exists():
+            files_to_undo.setdefault(file_path, []).append(undo_path)
+
+    if not files_to_undo and not new_files:
+        # No undo files available — signal caller to fall back to Apply-based remove
+        return False, "no_undo_files"
+
+    errors: list[str] = []
+    papgt_needs_rebuild = False
+
+    # Delete new (mod-added) files first
+    for file_path in new_files:
+        game_path = game_dir / file_path.replace("/", "\\")
+        try:
+            if game_path.exists():
+                game_path.unlink()
+                # Remove empty parent directory (standalone mod dir)
+                parent = game_path.parent
+                if (parent != game_dir and parent.exists()
+                        and not any(parent.iterdir())):
+                    parent.rmdir()
+                logger.info("revert_mod_direct: deleted %s", file_path)
+        except OSError as e:
+            errors.append(f"{file_path}: {e}")
+
+    # Apply undo patches in-place (vanilla bytes back to game files)
+    for file_path, undo_paths in files_to_undo.items():
+        game_path = game_dir / file_path.replace("/", "\\")
+        if not game_path.exists():
+            logger.warning("revert_mod_direct: game file missing %s", file_path)
+            continue
+
+        try:
+            buf = bytearray(game_path.read_bytes())
+            for undo_path in undo_paths:
+                entries = _load_range_backup_from_file(undo_path)
+                if entries:
+                    _apply_ranges_to_buf(buf, entries)
+            game_path.write_bytes(bytes(buf))
+            logger.info("revert_mod_direct: patched %s (%d undo file(s))",
+                        file_path, len(undo_paths))
+            if file_path.endswith(".pamt") or file_path.endswith(".paz"):
+                papgt_needs_rebuild = True
+        except OSError as e:
+            errors.append(f"{file_path}: {e}")
+
+    # Rebuild PAPGT if any PAZ/PAMT was touched
+    if papgt_needs_rebuild:
+        vanilla_dir = game_dir / "CDMods" / "vanilla"
+        try:
+            papgt_mgr = PapgtManager(game_dir, vanilla_dir)
+            papgt_bytes = papgt_mgr.rebuild(modified_pamts=None)
+            papgt_path = game_dir / "meta" / "0.papgt"
+            papgt_path.write_bytes(papgt_bytes)
+            logger.info("revert_mod_direct: rebuilt PAPGT")
+        except Exception as e:
+            logger.warning("revert_mod_direct: PAPGT rebuild failed: %s", e)
+
+    if errors:
+        return False, "Partial revert — some files failed:\n" + "\n".join(errors)
+    return True, "ok"
+
+
+def _load_range_backup_from_file(path: Path) -> list[tuple[int, bytes]] | None:
+    """Load a range backup (SPRS) from an explicit path."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if raw[:4] != SPARSE_MAGIC:
+        return None
+    entries: list[tuple[int, bytes]] = []
+    offset = 4
+    count = struct.unpack_from("<I", raw, offset)[0]
+    offset += 4
+    for _ in range(count):
+        file_offset = struct.unpack_from("<Q", raw, offset)[0]
+        offset += 8
+        length = struct.unpack_from("<I", raw, offset)[0]
+        offset += 4
+        entries.append((file_offset, raw[offset:offset + length]))
+        offset += length
+    return entries

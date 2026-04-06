@@ -1,17 +1,49 @@
 import logging
+import struct
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
 
-from cdumm.engine.delta_engine import generate_delta, get_changed_byte_ranges, save_delta
+from cdumm.engine.delta_engine import generate_delta, get_changed_byte_ranges, save_delta, SPARSE_MAGIC
 from cdumm.engine.snapshot_manager import SnapshotManager
 from cdumm.storage.database import Database
 
 logger = logging.getLogger(__name__)
 
 SCRIPT_TIMEOUT = 60  # seconds
+UNDO_SUFFIX = ".undo"  # per-mod vanilla range backup (same SPRS format as .vranges)
+
+
+def _write_undo_file(
+    delta_path: Path,
+    patches: list[tuple[int, bytes]],
+) -> None:
+    """Write a per-mod undo file alongside a delta.
+
+    The undo file stores the vanilla bytes at exactly the positions the mod
+    modifies, using the same SPRS sparse format as global .vranges backups.
+    This allows a single mod to be reverted directly (without a full Apply
+    cycle) by patching those positions back to vanilla in-place.
+
+    Only written for SPRS (sparse byte-range) deltas.  FULL_COPY and ENTR
+    deltas rely on the global vanilla backup as before.
+
+    patches: list of (offset, vanilla_bytes_at_offset)
+    """
+    if not patches:
+        return
+    undo_path = delta_path.with_suffix(delta_path.suffix + UNDO_SUFFIX)
+    buf = bytearray(SPARSE_MAGIC)
+    buf += struct.pack("<I", len(patches))
+    for off, data in patches:
+        buf += struct.pack("<QI", off, len(data))
+        buf += data
+    undo_path.write_bytes(bytes(buf))
+    logger.debug("Undo file written: %s (%d ranges, %d bytes)",
+                 undo_path.name, len(patches),
+                 sum(len(d) for _, d in patches))
 
 # Thread-local progress callback for import operations.
 # Set by ImportWorker before calling import functions.
@@ -82,6 +114,13 @@ from cdumm.engine.texture_mod_handler import detect_texture_mod, convert_texture
 
 # Pattern for valid game file paths: NNNN/N.paz, NNNN/N.pamt, meta/0.papgt, meta/0.pathc
 _GAME_FILE_RE = re.compile(r'^(\d{4}/\d+\.(?:paz|pamt)|meta/\d+\.(?:papgt|pathc))$')
+
+# Loose asset directories that live directly in the game folder (not inside PAZ archives).
+# Files under these directories are accepted as loose-file mods.
+_LOOSE_ASSET_DIRS = frozenset({
+    "ui", "soundassets", "sound", "video", "movies", "shaders",
+    "fonts", "locale", "data", "config",
+})
 
 
 def _verify_and_fix_pamt_crc(pamt_bytes: bytes, rel_path: str) -> bytes:
@@ -200,87 +239,82 @@ def _try_paz_entry_import(
         logger.debug("No entries for PAZ index %d in %s", paz_index, rel_path)
         return False
 
-    def _extract_entry(entry, paz_path):
-        """Extract and decompress a single entry from a PAZ file."""
-        return _extract_from_paz(entry, paz_path=str(paz_path))
-
     changed = 0
     paz_file_path = f"{dir_name}/{paz_index}.paz"
 
-    # Compare entries between mod and vanilla
-    for entry_path, mod_entry in mod_by_path.items():
-        van_entry = van_by_path.get(entry_path)
-        if van_entry is None:
-            continue  # New entry — handled separately
+    # Keep both PAZ files open across the entire comparison loop.
+    # Opening/closing 900 MB files per entry (the old pattern) was slow —
+    # each open costs a seek-to-start even though we immediately seek anyway.
+    with open(vanilla_paz_path, "rb") as van_f, open(mod_paz_path, "rb") as mod_f:
 
-        try:
-            # Quick check: if comp_size and offset are identical, skip
-            if (mod_entry.offset == van_entry.offset
-                    and mod_entry.comp_size == van_entry.comp_size):
-                # Same position and size — likely unchanged, but verify
-                # by reading raw bytes (fast, no decompression)
-                with open(mod_paz_path, "rb") as f:
-                    f.seek(mod_entry.offset)
-                    mod_raw = f.read(mod_entry.comp_size)
-                with open(vanilla_paz_path, "rb") as f:
-                    f.seek(van_entry.offset)
-                    van_raw = f.read(van_entry.comp_size)
-                if mod_raw == van_raw:
-                    continue
+        # Compare entries between mod and vanilla
+        for entry_path, mod_entry in mod_by_path.items():
+            van_entry = van_by_path.get(entry_path)
+            if van_entry is None:
+                continue  # New entry — handled separately
 
-            # Entry differs — decompress both and store mod's content
-            van_content = _extract_entry(van_entry, vanilla_paz_path)
-            mod_content = _extract_entry(mod_entry, mod_paz_path)
+            try:
+                # Quick check: if comp_size and offset are identical, compare raw bytes
+                if (mod_entry.offset == van_entry.offset
+                        and mod_entry.comp_size == van_entry.comp_size):
+                    mod_f.seek(mod_entry.offset)
+                    mod_raw = mod_f.read(mod_entry.comp_size)
+                    van_f.seek(van_entry.offset)
+                    van_raw = van_f.read(van_entry.comp_size)
+                    if mod_raw == van_raw:
+                        continue
 
-            if van_content == mod_content:
-                continue  # Decompressed content is the same
+                # Entry differs — decompress both and store mod's content
+                van_content = _extract_from_paz(van_entry, paz_path=str(vanilla_paz_path))
+                mod_content = _extract_from_paz(mod_entry, paz_path=str(mod_paz_path))
 
-            # Detect encryption: try decompressing the vanilla entry.
-            # If decompress fails, the entry is encrypted.
-            encrypted = van_entry.encrypted
-            if not encrypted and van_entry.compressed and van_entry.compression_type == 2:
-                try:
-                    with open(vanilla_paz_path, "rb") as f:
-                        f.seek(van_entry.offset)
-                        raw = f.read(van_entry.comp_size)
-                    lz4_decompress(raw, van_entry.orig_size)
-                except Exception:
-                    encrypted = True
+                if van_content == mod_content:
+                    continue  # Decompressed content is the same
 
-            metadata = {
-                "pamt_dir": dir_name,
-                "entry_path": van_entry.path,
-                "paz_index": van_entry.paz_index,
-                "compression_type": van_entry.compression_type,
-                "flags": van_entry.flags,
-                "vanilla_offset": van_entry.offset,
-                "vanilla_comp_size": van_entry.comp_size,
-                "vanilla_orig_size": van_entry.orig_size,
-                "encrypted": encrypted,
-            }
+                # Detect encryption: try decompressing the vanilla entry.
+                encrypted = van_entry.encrypted
+                if not encrypted and van_entry.compressed and van_entry.compression_type == 2:
+                    try:
+                        van_f.seek(van_entry.offset)
+                        raw = van_f.read(van_entry.comp_size)
+                        lz4_decompress(raw, van_entry.orig_size)
+                    except Exception:
+                        encrypted = True
 
-            safe_name = van_entry.path.replace("/", "_") + ".entr"
-            delta_path = deltas_dir / str(mod_id) / safe_name
-            save_entry_delta(mod_content, metadata, delta_path)
+                metadata = {
+                    "pamt_dir": dir_name,
+                    "entry_path": van_entry.path,
+                    "paz_index": van_entry.paz_index,
+                    "compression_type": van_entry.compression_type,
+                    "flags": van_entry.flags,
+                    "vanilla_offset": van_entry.offset,
+                    "vanilla_comp_size": van_entry.comp_size,
+                    "vanilla_orig_size": van_entry.orig_size,
+                    "encrypted": encrypted,
+                }
 
-            db.connection.execute(
-                "INSERT INTO mod_deltas (mod_id, file_path, delta_path, "
-                "byte_start, byte_end, entry_path) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (mod_id, paz_file_path, str(delta_path),
-                 van_entry.offset, van_entry.offset + van_entry.comp_size,
-                 van_entry.path))
+                safe_name = van_entry.path.replace("/", "_") + ".entr"
+                delta_path = deltas_dir / str(mod_id) / safe_name
+                save_entry_delta(mod_content, metadata, delta_path)
 
-            result.changed_files.append({
-                "file_path": paz_file_path,
-                "entry_path": van_entry.path,
-                "delta_path": str(delta_path),
-            })
-            changed += 1
+                db.connection.execute(
+                    "INSERT INTO mod_deltas (mod_id, file_path, delta_path, "
+                    "byte_start, byte_end, entry_path) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (mod_id, paz_file_path, str(delta_path),
+                     van_entry.offset, van_entry.offset + van_entry.comp_size,
+                     van_entry.path))
 
-        except Exception as e:
-            logger.warning("Entry comparison failed for %s: %s", entry_path, e)
-            continue
+                result.changed_files.append({
+                    "file_path": paz_file_path,
+                    "entry_path": van_entry.path,
+                    "delta_path": str(delta_path),
+                })
+                changed += 1
+
+            except Exception as e:
+                logger.warning("Entry comparison failed for %s: %s", entry_path, e)
+                continue
 
     if changed == 0:
         logger.debug("No changed entries in %s, falling back to byte-level", rel_path)
@@ -292,6 +326,86 @@ def _try_paz_entry_import(
     return True
 
 
+def _find_loose_file_candidates(path: Path, max_depth: int = 5) -> list[dict]:
+    """Recursively search for all loose-file mod roots (files/NNNN/ pattern).
+
+    Returns a list of manifest dicts, one per found variant.
+    """
+    results: list[dict] = []
+    seen_bases: set[str] = set()
+
+    def _check_candidate(candidate: Path) -> dict | None:
+        base_key = str(candidate)
+        if base_key in seen_bases:
+            return None
+        # Pattern 1: mod.json + files/
+        mod_json = candidate / "mod.json"
+        files_dir = candidate / "files"
+        if mod_json.exists() and files_dir.exists():
+            try:
+                with open(mod_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "modinfo" in data:
+                    modinfo = data["modinfo"]
+                    seen_bases.add(base_key)
+                    return {
+                        "format": "loose_file_mod",
+                        "id": modinfo.get("title", candidate.name),
+                        "files_dir": "files",
+                        "_manifest_path": mod_json,
+                        "_base_dir": candidate,
+                        "_modinfo": modinfo,
+                    }
+            except Exception:
+                pass
+        # Pattern 2: bare files/NNNN/
+        if files_dir.exists() and files_dir.is_dir():
+            try:
+                has_numbered = any(
+                    d.is_dir() and d.name.isdigit() and len(d.name) == 4
+                    for d in files_dir.iterdir()
+                )
+            except OSError:
+                has_numbered = False
+            if has_numbered:
+                seen_bases.add(base_key)
+                return {
+                    "format": "loose_file_mod",
+                    "id": candidate.name,
+                    "files_dir": "files",
+                    "_manifest_path": None,
+                    "_base_dir": candidate,
+                    "_modinfo": {"title": candidate.name},
+                }
+        return None
+
+    def _walk(directory: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        hit = _check_candidate(directory)
+        if hit:
+            results.append(hit)
+            return  # don't recurse into a found mod root
+        try:
+            children = [d for d in directory.iterdir() if d.is_dir()
+                        and not d.name.startswith((".", "_"))]
+        except OSError:
+            return
+        for child in children:
+            _walk(child, depth + 1)
+
+    _walk(path, 0)
+    return results
+
+
+def find_loose_file_variants(path: Path) -> list[dict]:
+    """Public API: find all loose-file mod variants in a directory tree.
+
+    Used by the GUI to detect multi-variant mods and show a picker.
+    """
+    return _find_loose_file_candidates(path, max_depth=5)
+
+
 def detect_loose_file_mod(path: Path) -> dict | None:
     """Detect mods that ship loose game files with a mod.json metadata file.
 
@@ -300,52 +414,15 @@ def detect_loose_file_mod(path: Path) -> dict | None:
 
     Returns a CB-compatible manifest dict for convert_to_paz_mod, or None.
     """
-    for candidate in [path, *[d for d in path.iterdir() if d.is_dir()]]:
-        mod_json = candidate / "mod.json"
-        files_dir = candidate / "files"
-        if not mod_json.exists() or not files_dir.exists():
-            continue
-        try:
-            with open(mod_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and "modinfo" in data:
-                # Translate to CB-compatible manifest
-                modinfo = data["modinfo"]
-                manifest = {
-                    "format": "loose_file_mod",
-                    "id": modinfo.get("title", candidate.name),
-                    "files_dir": "files",
-                    "_manifest_path": mod_json,
-                    "_base_dir": candidate,
-                    "_modinfo": modinfo,
-                }
-                logger.info("Detected loose file mod: %s", manifest["id"])
-                return manifest
-        except Exception:
-            continue
-
-    # Pattern 2: files/NNNN/ structure without mod.json (bare loose file mod)
-    for candidate in [path, *[d for d in path.iterdir() if d.is_dir()]]:
-        files_dir = candidate / "files"
-        if not files_dir.exists() or not files_dir.is_dir():
-            continue
-        # Check if files/ contains numbered game directories
-        has_numbered = any(
-            d.is_dir() and d.name.isdigit() and len(d.name) == 4
-            for d in files_dir.iterdir()
-        )
-        if has_numbered:
-            manifest = {
-                "format": "loose_file_mod",
-                "id": candidate.name,
-                "files_dir": "files",
-                "_manifest_path": None,
-                "_base_dir": candidate,
-                "_modinfo": {"title": candidate.name},
-            }
-            logger.info("Detected bare loose file mod (no mod.json): %s", candidate.name)
-            return manifest
-
+    candidates = _find_loose_file_candidates(path, max_depth=5)
+    if len(candidates) == 1:
+        logger.info("Detected loose file mod: %s", candidates[0]["id"])
+        return candidates[0]
+    if len(candidates) > 1:
+        # Multiple variants found — caller should use find_loose_file_variants()
+        # and show a picker. Return None so the import doesn't silently pick one.
+        logger.info("Found %d loose file variants, picker needed", len(candidates))
+        return None
     return None
 
 
@@ -394,8 +471,9 @@ def _match_game_files(
                 if matched:
                     break
 
-            # Try exact match against snapshot (existing vanilla files)
-            if snapshot.get_file_hash(candidate) is not None:
+            # Try exact match against snapshot (existing vanilla files).
+            # Use file_in_snapshot() — O(1) set lookup vs per-call DB query.
+            if snapshot.file_in_snapshot(candidate):
                 matches.append((candidate, f, False))
                 matched = True
                 break
@@ -407,6 +485,16 @@ def _match_game_files(
                 matches.append((candidate, f, is_new))
                 matched = True
                 break
+
+            # Loose asset file — check if it lives under a known loose dir
+            # (e.g. ui/titleview_01_1080.mp4) or exists directly in game_dir.
+            top_dir = candidate.split("/")[0].lower()
+            if top_dir in _LOOSE_ASSET_DIRS or "/" not in candidate:
+                game_file = game_dir / candidate.replace("/", "\\")
+                if game_file.exists() or top_dir in _LOOSE_ASSET_DIRS:
+                    matches.append((candidate, f, not game_file.exists()))
+                    matched = True
+                    break
 
         if matched:
             continue
@@ -695,6 +783,23 @@ def import_from_zip(
                     existing_mod_id=existing_mod_id, modinfo=modinfo)
                 return result
 
+        # Check for loose file mod (files/NNNN/ structure)
+        lfm = detect_loose_file_mod(tmp_path)
+        if lfm is not None:
+            lfm_work = Path(tmp) / "_lfm_converted"
+            converted = convert_to_paz_mod(lfm, game_dir, lfm_work)
+            if converted is not None:
+                mi = lfm.get("_modinfo", {})
+                lfm_name = mi.get("title", mod_name)
+                lfm_modinfo = {
+                    "name": mi.get("title"), "version": mi.get("version"),
+                    "author": mi.get("author"), "description": mi.get("description"),
+                }
+                result = _process_extracted_files(
+                    converted, game_dir, db, snapshot, deltas_dir, lfm_name,
+                    existing_mod_id=existing_mod_id, modinfo=lfm_modinfo)
+                return result
+
         # Check for JSON byte-patch format — use ENTR deltas for proper composition
         jp_data = detect_json_patch(tmp_path)
         if jp_data is not None:
@@ -891,9 +996,13 @@ def _find_best_variant(folder_path: Path) -> Path | None:
     if len(variants) < 2:
         return None  # not multi-variant
 
-    # Multiple variants found. Pick the last one alphabetically (usually highest value).
-    # e.g., FatStacks10x > FatStacks2x, or variant names sorted naturally
-    variants.sort(key=lambda p: p.name)
+    # Multiple variants found. Pick the last one by natural/numeric sort so
+    # "FatStacks10x" > "FatStacks2x" instead of the wrong lexicographic order.
+    import re as _re
+    def _nat_key(p):
+        parts = _re.split(r'(\d+)', p.name)
+        return [int(x) if x.isdigit() else x.lower() for x in parts]
+    variants.sort(key=_nat_key)
     chosen = variants[-1]
     logger.info("Found %d variants: %s. Picking: %s",
                 len(variants),
@@ -914,7 +1023,7 @@ def import_from_script(
 
         # Copy game files the script might modify into sandbox
         # Copy all PAZ/PAMT files (script might target any of them)
-        for dir_name in [f"{i:04d}" for i in range(33)]:
+        for dir_name in [f"{i:04d}" for i in range(36)]:
             src_dir = game_dir / dir_name
             if src_dir.exists():
                 dst_dir = sandbox_path / dir_name
@@ -1417,11 +1526,9 @@ def _process_extracted_files(
             # both files in 1MB chunks. Never loads the full files into memory.
             # This handles 912MB PAZ files in ~2 seconds with ~2MB RAM.
             if mod_size > FAST_TRACK_THRESHOLD and mod_size == van_size:
-                import struct
-                from cdumm.engine.delta_engine import SPARSE_MAGIC
-
                 CHUNK = 1024 * 1024
                 patches: list[tuple[int, bytes]] = []
+                undo_patches: list[tuple[int, bytes]] = []
                 identical = True
 
                 with open(vanilla_source, "rb") as fv, open(extracted_path, "rb") as fm:
@@ -1443,10 +1550,14 @@ def _process_extracted_files(
                                         in_diff = True
                                 else:
                                     if in_diff:
-                                        patches.append((diff_start, cm[diff_start - offset:i]))
+                                        chunk_off = diff_start - offset
+                                        patches.append((diff_start, cm[chunk_off:i]))
+                                        undo_patches.append((diff_start, cv[chunk_off:i]))
                                         in_diff = False
                             if in_diff:
-                                patches.append((diff_start, cm[diff_start - offset:]))
+                                chunk_off = diff_start - offset
+                                patches.append((diff_start, cm[chunk_off:]))
+                                undo_patches.append((diff_start, cv[chunk_off:]))
                         offset += len(cv)
 
                 if identical:
@@ -1464,8 +1575,8 @@ def _process_extracted_files(
                 safe_name = rel_path.replace("/", "_") + ".bsdiff"
                 delta_path = deltas_dir / str(mod_id) / safe_name
                 save_delta(delta_bytes, delta_path)
+                _write_undo_file(delta_path, undo_patches)
 
-                import hashlib
                 # Use streaming to get byte ranges without re-reading
                 for off, data in patches:
                     bs, be = off, off + len(data)
@@ -1508,10 +1619,14 @@ def _process_extracted_files(
             # Get byte ranges
             byte_ranges = get_changed_byte_ranges(vanilla_bytes, modified_bytes)
 
-            # Save delta to disk
+            # Save delta to disk, plus per-mod undo file (vanilla bytes at changed positions)
             safe_name = rel_path.replace("/", "_") + ".bsdiff"
             delta_path = deltas_dir / str(mod_id) / safe_name
             save_delta(delta_bytes, delta_path)
+            if delta_bytes[:4] == SPARSE_MAGIC:
+                undo_patches = [(bs, vanilla_bytes[bs:be]) for bs, be in byte_ranges
+                                if be <= len(vanilla_bytes)]
+                _write_undo_file(delta_path, undo_patches)
 
             # Store each byte range with a hash of the vanilla bytes at that range.
             import hashlib
@@ -1539,6 +1654,26 @@ def _process_extracted_files(
             logger.error("Failed to process %s: %s", rel_path, e, exc_info=True)
             result.error = f"Failed to process {rel_path}: {e}"
             return result
+
+    # Clean up PAMT byte-range deltas created before PAZ ENTR decomposition
+    for handled_path in _paz_entr_handled:
+        if handled_path.endswith(".pamt"):
+            cursor = db.connection.execute(
+                "SELECT COUNT(*) FROM mod_deltas "
+                "WHERE mod_id = ? AND file_path = ? AND entry_path IS NULL",
+                (mod_id, handled_path),
+            )
+            count = cursor.fetchone()[0]
+            if count > 0:
+                db.connection.execute(
+                    "DELETE FROM mod_deltas "
+                    "WHERE mod_id = ? AND file_path = ? AND entry_path IS NULL",
+                    (mod_id, handled_path),
+                )
+                result.changed_files = [
+                    cf for cf in result.changed_files
+                    if cf.get("file_path") != handled_path or cf.get("entry_path")
+                ]
 
     db.connection.commit()
     logger.info("Imported mod '%s': %d files changed", mod_name, len(result.changed_files))

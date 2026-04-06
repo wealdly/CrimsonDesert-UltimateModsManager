@@ -14,12 +14,18 @@ logger = logging.getLogger(__name__)
 GITHUB_REPO = "faisalkindi/CrimsonDesert-UltimateModsManager"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
+# Auto-update is disabled on this fork to prevent upstream releases from
+# overwriting locally-built binaries.
+_UPDATE_DISABLED = True
+
 
 def check_for_update(current_version: str) -> dict | None:
     """Check if a newer version exists on GitHub.
 
     Returns {"tag": "v1.0.0", "url": "...", "body": "...", "download_url": "..."} or None.
     """
+    if _UPDATE_DISABLED:
+        return None
     try:
         req = urllib.request.Request(RELEASES_URL, headers={"User-Agent": "CDUMM"})
         with urllib.request.urlopen(req, timeout=10) as resp:
