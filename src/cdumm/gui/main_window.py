@@ -1728,6 +1728,14 @@ class MainWindow(QMainWindow):
         apply_btn.clicked.connect(self._on_apply)
         ab_layout.addWidget(apply_btn)
 
+        validate_btn = QPushButton("  Validate  ")
+        validate_btn.setObjectName("validateBtn")
+        validate_btn.setToolTip(
+            "Check enabled mods for compatibility with the current game version"
+        )
+        validate_btn.clicked.connect(self._on_validate)
+        ab_layout.addWidget(validate_btn)
+
         launch_btn = QPushButton("  Launch Game  ")
         launch_btn.setObjectName("launchBtn")
         launch_btn.clicked.connect(self._on_launch_game)
@@ -3004,6 +3012,41 @@ class MainWindow(QMainWindow):
         self._snapshot_applied_state()
         self.statusBar().showMessage("Mods applied successfully!", 10000)
         self._log_activity("apply", "Mods applied successfully")
+
+    def _on_validate(self) -> None:
+        if not self._db or not self._game_dir:
+            return
+        from cdumm.engine.mod_validator import ValidateWorker
+        progress = ProgressDialog("Validating Mod Compatibility...", self)
+        worker = ValidateWorker(self._db.db_path, self._game_dir, self._vanilla_dir)
+        thread = QThread()
+        self._run_worker(worker, thread, progress,
+                         on_finished=self._on_validate_finished)
+
+    def _on_validate_finished(self, issues: list) -> None:
+        from cdumm.gui.validation_dialog import ValidationDialog
+        dialog = ValidationDialog(issues, self)
+        dialog.exec()
+        if dialog.should_disable and dialog.affected_mod_ids:
+            disabled = 0
+            for mod in self._mod_manager.list_mods():
+                if mod["id"] in dialog.affected_mod_ids and mod["enabled"]:
+                    self._mod_manager.set_enabled(mod["id"], False)
+                    disabled += 1
+            if disabled:
+                self._refresh_all()
+                self.statusBar().showMessage(
+                    f"Disabled {disabled} incompatible mod(s). "
+                    "Click Apply to revert their changes.", 10000
+                )
+        if issues:
+            errors = sum(1 for i in issues if i.severity == "error")
+            warnings = sum(1 for i in issues if i.severity == "warning")
+            self._log_activity(
+                "warning", f"Validation: {errors} error(s), {warnings} warning(s)"
+            )
+        else:
+            self._log_activity("verify", "Validation passed — all mods compatible")
 
     def _post_apply_verify(self) -> None:
         """Deep verification after Apply.
