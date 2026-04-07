@@ -1728,6 +1728,13 @@ class MainWindow(QMainWindow):
         apply_btn.clicked.connect(self._on_apply)
         ab_layout.addWidget(apply_btn)
 
+        launch_btn = QPushButton("  Launch Game  ")
+        launch_btn.setObjectName("launchBtn")
+        launch_btn.clicked.connect(self._on_launch_game)
+        ab_layout.addWidget(launch_btn)
+
+        ab_layout.addStretch()
+
         validate_btn = QPushButton("  Validate  ")
         validate_btn.setObjectName("validateBtn")
         validate_btn.setToolTip(
@@ -1735,13 +1742,6 @@ class MainWindow(QMainWindow):
         )
         validate_btn.clicked.connect(self._on_validate)
         ab_layout.addWidget(validate_btn)
-
-        launch_btn = QPushButton("  Launch Game  ")
-        launch_btn.setObjectName("launchBtn")
-        launch_btn.clicked.connect(self._on_launch_game)
-        ab_layout.addWidget(launch_btn)
-
-        ab_layout.addStretch()
 
         fix_btn = QPushButton("Fix Everything")
         fix_btn.setObjectName("fixBtn")
