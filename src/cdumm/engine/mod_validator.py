@@ -304,7 +304,7 @@ class ValidateWorker(QObject):
     """Background worker that validates enabled mods for compatibility."""
 
     progress_updated = Signal(int, str)
-    finished = Signal(list)       # list[ValidationIssue]
+    finished = Signal(object)     # list[ValidationIssue]
     error_occurred = Signal(str)
 
     def __init__(self, db_path: Path, game_dir: Path, vanilla_dir: Path) -> None:
